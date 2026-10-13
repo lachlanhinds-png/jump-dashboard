@@ -240,8 +240,15 @@ ui <- page_sidebar(
   theme = theme,
   sidebar = sidebar(
     width = 300,
-    dateRangeInput("dates", "Date range", start = Sys.Date() - 13, end = Sys.Date()),
+    dateRangeInput("dates", "Date range (shows this window)", start = Sys.Date() - 27, end = Sys.Date()),
+    layout_columns(
+      col_widths = c(6, 6),
+      actionButton("preset_28", "Last 28 days", class = "btn-sm btn-outline-secondary w-100"),
+      actionButton("preset_365", "Last 12 months", class = "btn-sm btn-outline-secondary w-100")
+    ),
+    tags$div(style = "margin-top:10px;"),
     actionButton("fetch", "Fetch latest data", class = "btn-primary w-100"),
+    tags$small("Fetch pulls new data from Catapult for the dates above."),
     tags$div(style = "margin-top:10px;"),
     textOutput("status"),
     hr(),
@@ -284,10 +291,6 @@ server <- function(input, output, session) {
   if (!is.null(stored_on_start)) {
     raw_data(stored_on_start)
     status_msg(paste0("Loaded ", nrow(stored_on_start), " stored jump events. Fetch only pulls what's new."))
-    default_start <- as.Date(as.POSIXct(max(stored_on_start$start_time, na.rm = TRUE), origin = "1970-01-01", tz = "UTC"))
-    session$onFlushed(function() {
-      updateDateRangeInput(session, "dates", start = default_start, end = Sys.Date())
-    }, once = TRUE)
   } else if (!nzchar(Sys.getenv("SUPABASE_HOST"))) {
     status_msg("Database not configured (see setup notes at the top of this file) - Fetch will pull from Catapult but won't be saved.")
   } else {
@@ -329,7 +332,19 @@ server <- function(input, output, session) {
     })
   }
 
+  # The UI is built once when the app starts, so set the rolling 28-day
+  # window fresh for every visitor (otherwise it goes stale on a long-running app).
+  session$onFlushed(function() {
+    updateDateRangeInput(session, "dates", start = Sys.Date() - 27, end = Sys.Date())
+  }, once = TRUE)
+
   observeEvent(input$fetch, { do_fetch() })
+  observeEvent(input$preset_28, {
+    updateDateRangeInput(session, "dates", start = Sys.Date() - 27, end = Sys.Date())
+  })
+  observeEvent(input$preset_365, {
+    updateDateRangeInput(session, "dates", start = Sys.Date() - 364, end = Sys.Date())
+  })
   output$status <- renderText(status_msg())
 
   # Shaped data: one row per jump, with date and jump time (seconds) attached.
@@ -358,10 +373,40 @@ server <- function(input, output, session) {
     selectInput("athlete", "Athlete", choices = athletes, selected = athletes[1])
   })
 
-  # Just this one athlete's jumps.
-  athlete_data <- reactive({
+  # All of this athlete's stored jumps (full history). The chronic line is
+  # worked out from this, so it is correct even at the start of the window.
+  athlete_all <- reactive({
     req(shaped(), input$athlete)
     shaped() %>% filter(athlete_name == input$athlete, !is.na(.jump_time_s))
+  })
+
+  # Just this athlete's jumps inside the chosen date window (default: last 28 days).
+  athlete_data <- reactive({
+    d <- athlete_all()
+    req(input$dates)
+    d %>% filter(.date >= input$dates[1], .date <= input$dates[2])
+  })
+
+  # Chronic high-jump load: for every calendar day, the average number of
+  # high jumps per day over the last 28 days (that day and the 27 before it).
+  # Rest days count as zero. Needs 28 days of history, so the first 27 days
+  # after an athlete's first stored session are left blank rather than shown low.
+  chronic_daily <- reactive({
+    d <- athlete_all()
+    req(nrow(d) > 0)
+    cut <- high_cut_val()
+    daily <- d %>%
+      group_by(.date) %>%
+      summarise(high = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
+    days <- seq(min(daily$.date), max(Sys.Date(), max(daily$.date)), by = "day")
+    full <- data.frame(date = days) %>%
+      left_join(daily, by = c("date" = ".date")) %>%
+      mutate(high = ifelse(is.na(high), 0, high))
+    csum <- cumsum(full$high)
+    lagged <- c(rep(0, 28), csum)[seq_along(csum)]
+    full$chronic <- (csum - lagged) / 28
+    full$chronic[seq_len(min(27, nrow(full)))] <- NA_real_
+    full
   })
 
   session_summary <- reactive({
@@ -405,13 +450,21 @@ server <- function(input, output, session) {
 
   output$trend_header <- renderText({
     n <- if (is.null(input$top_n) || is.na(input$top_n)) 20 else input$top_n
-    paste0("Jump Time Trend (max, average of top ", n, " jumps) with total and high (>= ", high_cut_val(), ") jump counts, per session")
+    paste0("Jump Time Trend (max, average of top ", n, " jumps) with total and high (>= ", high_cut_val(),
+           ") jump counts per session, and chronic high jumps (28-day average per day, shaded)")
   })
 
   output$trend_plot <- renderPlotly({
-    agg <- session_summary()
+    agg <- session_summary() %>%
+      left_join(chronic_daily() %>% select(date, chronic), by = "date")
     req(nrow(agg) > 0)
     plot_ly(agg, x = ~session_label) %>%
+      # Chronic: rolling 28-day average of high jumps per day (rest days = 0),
+      # drawn first so it sits behind everything as a light shaded area.
+      add_trace(y = ~chronic, name = "Chronic high jumps (28-day avg/day)", type = "scatter", mode = "lines",
+                yaxis = "y2", fill = "tozeroy", connectgaps = FALSE,
+                line = list(color = "rgba(209,96,77,0.9)", width = 2, shape = "spline"),
+                fillcolor = "rgba(209,96,77,0.18)") %>%
       # Columns: total and high jump counts per session, on their own
       # (right-hand) axis since counts and seconds are on different scales.
       # Semi-transparent so the time lines stay readable through them.
