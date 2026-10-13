@@ -458,13 +458,18 @@ server <- function(input, output, session) {
     agg <- session_summary() %>%
       left_join(chronic_daily() %>% select(date, chronic), by = "date")
     req(nrow(agg) > 0)
-    plot_ly(agg, x = ~session_label) %>%
-      # Chronic: rolling 28-day average of high jumps per day (rest days = 0),
-      # drawn first so it sits behind everything as a light shaded area.
-      add_trace(y = ~chronic, name = "Chronic high jumps (28-day avg/day)", type = "scatter", mode = "lines",
+    agg$chronic <- as.numeric(agg$chronic)
+    p <- plot_ly(agg, x = ~session_label)
+    # Chronic: rolling 28-day average of high jumps per day (rest days = 0),
+    # drawn first so it sits behind everything as a light shaded area.
+    # Skipped when there isn't 28 days of history yet (all values blank).
+    if (any(!is.na(agg$chronic))) {
+      p <- p %>% add_trace(y = ~chronic, name = "Chronic high jumps (28-day avg/day)", type = "scatter", mode = "lines",
                 yaxis = "y2", fill = "tozeroy", connectgaps = FALSE,
                 line = list(color = "rgba(209,96,77,0.9)", width = 2, shape = "spline"),
-                fillcolor = "rgba(209,96,77,0.18)") %>%
+                fillcolor = "rgba(209,96,77,0.18)")
+    }
+    p %>%
       # Columns: total and high jump counts per session, on their own
       # (right-hand) axis since counts and seconds are on different scales.
       # Semi-transparent so the time lines stay readable through them.
