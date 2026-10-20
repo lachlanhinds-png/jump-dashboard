@@ -364,6 +364,7 @@ session_stats <- function(d, topn, cut) {
 ui <- page_sidebar(
   title = "Jump Time Dashboard",
   theme = theme,
+  fillable = FALSE,   # let the whole page scroll instead of squeezing every card into one screen
   tags$head(tags$style(".view-mode .form-group, .view-mode .shiny-input-container { margin-bottom: 0; }")),
   sidebar = sidebar(
     width = 300,
@@ -406,7 +407,7 @@ ui <- page_sidebar(
                           choices = c("Rolling day by day" = "day", "Week view (Mon\u2013Sun)" = "week"),
                           selected = "day")))
     ),
-    plotlyOutput("trend_plot", height = 750)
+    plotlyOutput("trend_plot", height = 680)
   ),
   card(
     card_header(textOutput("table_header")),
@@ -633,31 +634,24 @@ server <- function(input, output, session) {
     if (is_week()) {
       w <- week_summary() %>%
         left_join(chronic_weekly() %>% select(week, chronic), by = "week")
-      data.frame(label = w$week_label, jumps = w$jumps, high_jumps = w$high_jumps,
+      data.frame(label = w$week_label, hover = paste0("Week ", w$week_range, " (", w$sessions, " sessions)"),
+                 jumps = w$jumps, high_jumps = w$high_jumps,
                  max_time_s = w$max_time_s, avg_time_s = w$avg_time_s,
                  chronic = as.numeric(w$chronic), stringsAsFactors = FALSE)
     } else {
       s <- session_summary() %>%
         left_join(chronic_daily() %>% select(date, chronic), by = "date")
-      data.frame(label = s$session_label, jumps = s$jumps, high_jumps = s$high_jumps,
+      # Short x labels ("Tue 13 Oct") keep the chart tall; the full session name
+      # is in the hover. Two sessions on one day get (1), (2).
+      lab <- format(s$date, "%a %d %b")
+      idx <- ave(seq_along(lab), lab, FUN = seq_along)
+      cnt <- ave(seq_along(lab), lab, FUN = length)
+      lab <- ifelse(cnt > 1, paste0(lab, " (", idx, ")"), lab)
+      data.frame(label = lab, hover = paste0(s$activity_name, " - ", format(s$date, "%a %d %b")),
+                 jumps = s$jumps, high_jumps = s$high_jumps,
                  max_time_s = s$max_time_s, avg_time_s = s$avg_time_s,
                  chronic = as.numeric(s$chronic), stringsAsFactors = FALSE)
     }
-  })
-
-  output$overview_jumps <- renderText({
-    d <- athlete_data()
-    paste0(input$athlete, ": ", nrow(d), " jumps across ", length(unique(d$activity_name)), " session(s)")
-  })
-  output$overview_avg <- renderText({
-    d <- athlete_data()
-    req(nrow(d) > 0)
-    paste0("Average jump time (all jumps): ", round(mean(d$.jump_time_s), 2), " s")
-  })
-  output$overview_max <- renderText({
-    d <- athlete_data()
-    req(nrow(d) > 0)
-    paste0("Max jump time: ", round(max(d$.jump_time_s), 2), " s")
   })
 
   output$trend_header <- renderText({
@@ -686,6 +680,7 @@ server <- function(input, output, session) {
     if (any(!is.na(agg$chronic))) {
       p <- p %>% add_trace(y = ~chronic, name = chronic_name, type = "scatter", mode = "lines",
                 yaxis = "y2", fill = "tozeroy", connectgaps = FALSE,
+                text = ~hover, hovertemplate = "<b>%{text}</b><br>Chronic high jumps: %{y:.1f}<extra></extra>",
                 line = list(color = "rgb(232,110,90)", width = 3.5, shape = "spline"),
                 fillcolor = "rgba(232,110,90,0.42)")
     }
@@ -694,26 +689,32 @@ server <- function(input, output, session) {
       # since counts and seconds are on different scales. Semi-transparent so
       # the time lines stay readable through them.
       add_trace(y = ~jumps, name = "Total jumps", type = "bar", yaxis = "y2",
+                text = ~hover, hovertemplate = "<b>%{text}</b><br>Total jumps: %{y}<extra></extra>",
                 marker = list(color = "rgba(111,140,163,0.45)")) %>%
       add_trace(y = ~high_jumps, name = "High jumps", type = "bar", yaxis = "y2",
+                text = ~hover, hovertemplate = "<b>%{text}</b><br>High jumps: %{y}<extra></extra>",
                 marker = list(color = "rgba(209,96,77,0.55)")) %>%
       # Lines: jump time (left axis).
       add_trace(y = ~max_time_s, name = "Max", type = "scatter", mode = "lines+markers",
+                text = ~hover, hovertemplate = "<b>%{text}</b><br>Max: %{y:.2f} s<extra></extra>",
                 line = list(color = "#E3B23C"), marker = list(color = "#E3B23C")) %>%
       add_trace(y = ~avg_time_s, name = "Average (top N)", type = "scatter", mode = "lines+markers",
+                text = ~hover, hovertemplate = "<b>%{text}</b><br>Average (top N): %{y:.2f} s<extra></extra>",
                 line = list(color = "#4FB3A9"), marker = list(color = "#4FB3A9")) %>%
       layout(
         barmode = "group", bargap = 0.35,
         paper_bgcolor = "transparent", plot_bgcolor = "transparent",
         font = list(color = "#EDE3CE", size = 10),
-        xaxis = list(title = "", showgrid = FALSE, automargin = TRUE, tickangle = -35, tickfont = list(size = 9),
+        xaxis = list(title = "", showgrid = FALSE, automargin = TRUE, tickangle = -45, tickfont = list(size = 10),
                      categoryorder = "array", categoryarray = agg$label),
         yaxis = list(title = "Jump Time (s)", showgrid = FALSE, zeroline = FALSE, automargin = TRUE, dtick = 0.05,
                      titlefont = list(size = 11), tickfont = list(size = 9)),
         yaxis2 = list(title = "# Jumps", overlaying = "y", side = "right", showgrid = FALSE, zeroline = FALSE,
                       automargin = TRUE, rangemode = "tozero", tickformat = "d",
                       titlefont = list(size = 11, color = "#8FA9BD"), tickfont = list(size = 9, color = "#8FA9BD")),
-        legend = list(font = list(size = 10))
+        # Legend along the top (not down the right-hand side) so the plot gets the full width.
+        legend = list(orientation = "h", x = 0, y = 1.1, font = list(size = 11)),
+        margin = list(t = 50)
       )
   })
 
@@ -834,8 +835,12 @@ server <- function(input, output, session) {
       main_display,
       escape = FALSE,
       rownames = FALSE,
+      fillContainer = FALSE,
       options = list(
-        pageLength = 20,
+        paging = FALSE,            # one long list that scrolls inside its own box...
+        scrollY = "520px",         # ...while the whole page also scrolls
+        scrollCollapse = TRUE,
+        dom = "fti",
         columnDefs = list(
           list(targets = key_col, visible = FALSE),
           list(targets = 0, orderable = FALSE, className = "details-control", width = "18px")
