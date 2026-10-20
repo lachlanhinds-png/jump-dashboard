@@ -689,10 +689,10 @@ server <- function(input, output, session) {
       # since counts and seconds are on different scales. Semi-transparent so
       # the time lines stay readable through them.
       add_trace(y = ~jumps, name = "Total jumps", type = "bar", yaxis = "y2",
-                text = ~hover, hovertemplate = "<b>%{text}</b><br>Total jumps: %{y}<extra></extra>",
+                text = ~hover, textposition = "none", hovertemplate = "<b>%{text}</b><br>Total jumps: %{y}<extra></extra>",
                 marker = list(color = "rgba(111,140,163,0.45)")) %>%
       add_trace(y = ~high_jumps, name = "High jumps", type = "bar", yaxis = "y2",
-                text = ~hover, hovertemplate = "<b>%{text}</b><br>High jumps: %{y}<extra></extra>",
+                text = ~hover, textposition = "none", hovertemplate = "<b>%{text}</b><br>High jumps: %{y}<extra></extra>",
                 marker = list(color = "rgba(209,96,77,0.55)")) %>%
       # Lines: jump time (left axis).
       add_trace(y = ~max_time_s, name = "Max", type = "scatter", mode = "lines+markers",
