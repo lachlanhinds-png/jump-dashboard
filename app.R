@@ -686,8 +686,8 @@ server <- function(input, output, session) {
     if (any(!is.na(agg$chronic))) {
       p <- p %>% add_trace(y = ~chronic, name = chronic_name, type = "scatter", mode = "lines",
                 yaxis = "y2", fill = "tozeroy", connectgaps = FALSE,
-                line = list(color = "rgba(209,96,77,0.9)", width = 2, shape = "spline"),
-                fillcolor = "rgba(209,96,77,0.18)")
+                line = list(color = "rgb(232,110,90)", width = 3.5, shape = "spline"),
+                fillcolor = "rgba(232,110,90,0.42)")
     }
     p %>%
       # Columns: total and high jump counts, on their own (right-hand) axis
