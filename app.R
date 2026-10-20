@@ -100,7 +100,7 @@ load_stored_data <- function() {
 KEY_COLUMNS <- c("activity_id", "athlete_id", "start_time", "end_time")
 
 sync_jumps <- function(d, start_date, end_date) {
-  res <- list(upserted = 0, removed_stale = 0, removed_orphan = 0,
+  res <- list(upserted = 0, removed_stale = 0, removed_orphan = 0, detail = "",
               failed = length(attr(d, "failed_ids")), skipped_cleanup = FALSE, note = "")
   has_rows <- !is.null(d) && nrow(d) > 0
   complete_ids <- attr(d, "complete_ids")
@@ -145,10 +145,21 @@ sync_jumps <- function(d, start_date, end_date) {
       s_epoch, " AND min(start_time) < ", e_epoch, ") AND activity_id NOT IN (", qlist(all_ids), ")")
   }
 
+  # (counts come back from Postgres as 64-bit integers, which break ordinary
+  # arithmetic like 0.5 * n - so convert to plain numbers)
   count_where <- function(w) if (is.null(w)) 0 else
-    DBI::dbGetQuery(con, paste0("SELECT count(*) AS n FROM jumps WHERE ", w))$n
-  window_rows <- DBI::dbGetQuery(con, paste0(
-    "SELECT count(*) AS n FROM jumps WHERE start_time >= ", s_epoch, " AND start_time < ", e_epoch))$n
+    as.numeric(DBI::dbGetQuery(con, paste0("SELECT count(*) AS n FROM jumps WHERE ", w))$n)
+  window_rows <- as.numeric(DBI::dbGetQuery(con, paste0(
+    "SELECT count(*) AS n FROM jumps WHERE start_time >= ", s_epoch, " AND start_time < ", e_epoch))$n)
+  # Which sessions the rows to remove belong to, so the result can say what changed.
+  describe_where <- function(w) {
+    if (is.null(w)) return(character())
+    x <- DBI::dbGetQuery(con, paste0(
+      "SELECT activity_name, count(*) AS n FROM jumps WHERE ", w,
+      " GROUP BY activity_name ORDER BY count(*) DESC LIMIT 8"))
+    if (nrow(x) == 0) return(character())
+    paste0(x$activity_name, " (", as.numeric(x$n), ")")
+  }
   n_stale <- count_where(where_stale)
   n_orphan <- count_where(where_orphan)
   do_cleanup <- TRUE
@@ -157,6 +168,10 @@ sync_jumps <- function(d, start_date, end_date) {
     res$skipped_cleanup <- TRUE
     res$note <- paste0("Cleanup skipped: it would have removed ", n_stale + n_orphan, " of ", window_rows,
                        " stored rows in this window, which looks wrong. Nothing was deleted.")
+  }
+
+  if (do_cleanup && (n_stale + n_orphan) > 0) {
+    res$detail <- paste(unique(c(describe_where(where_stale), describe_where(where_orphan))), collapse = "; ")
   }
 
   DBI::dbWithTransaction(con, {
@@ -447,7 +462,7 @@ server <- function(input, output, session) {
         clean_txt <- ""
         if (!is.null(sync_info)) {
           removed <- sync_info$removed_stale + sync_info$removed_orphan
-          if (removed > 0) clean_txt <- paste0(clean_txt, "Removed ", removed, " rows Catapult no longer has. ")
+          if (removed > 0) clean_txt <- paste0(clean_txt, "Removed ", removed, " rows Catapult no longer has (", sync_info$detail, "). ")
           if (sync_info$failed > 0) clean_txt <- paste0(clean_txt, sync_info$failed, " activities were skipped (Catapult errors) - refresh again. ")
           if (nzchar(sync_info$note)) clean_txt <- paste0(clean_txt, sync_info$note, " ")
         }
