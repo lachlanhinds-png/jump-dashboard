@@ -82,22 +82,30 @@ load_stored_data <- function() {
   as_tibble(d)
 }
 
-# Adds newly-fetched rows to the permanent store. Safe to call repeatedly
-# with overlapping date ranges - the unique constraint on
-# (activity_id, athlete_id, start_time, end_time) means re-fetching the same
-# jump twice never creates a duplicate row.
+# Adds newly-fetched rows to the permanent store, and refreshes rows that are
+# already there. Safe to call repeatedly with overlapping date ranges - the
+# unique constraint on (activity_id, athlete_id, start_time, end_time) means a
+# jump is never duplicated. If a jump is already stored, its descriptive
+# fields (session name, athlete name, period name, values) are overwritten with
+# what Catapult has now, so renaming or coding a session in OpenField after
+# it uploads is picked up on the next refresh.
+KEY_COLUMNS <- c("activity_id", "athlete_id", "start_time", "end_time")
+
 upsert_jumps <- function(df) {
   if (is.null(df) || nrow(df) == 0) return(invisible(0))
   for (col in setdiff(DB_COLUMNS, colnames(df))) df[[col]] <- NA
   df <- df[, DB_COLUMNS, drop = FALSE]
+  df <- df[!duplicated(df[, KEY_COLUMNS, drop = FALSE]), , drop = FALSE]
 
+  update_cols <- setdiff(DB_COLUMNS, KEY_COLUMNS)
   con <- get_db_con()
   on.exit(DBI::dbDisconnect(con))
   DBI::dbWriteTable(con, "jumps_staging", df, temporary = TRUE, overwrite = TRUE)
   DBI::dbExecute(con, paste0(
     "INSERT INTO jumps (", paste(DB_COLUMNS, collapse = ", "), ") ",
     "SELECT ", paste(DB_COLUMNS, collapse = ", "), " FROM jumps_staging ",
-    "ON CONFLICT (activity_id, athlete_id, start_time, end_time) DO NOTHING"
+    "ON CONFLICT (", paste(KEY_COLUMNS, collapse = ", "), ") DO UPDATE SET ",
+    paste0(update_cols, " = EXCLUDED.", update_cols, collapse = ", ")
   ))
   invisible(nrow(df))
 }
@@ -240,15 +248,17 @@ ui <- page_sidebar(
   theme = theme,
   sidebar = sidebar(
     width = 300,
-    dateRangeInput("dates", "Date range (shows this window)", start = Sys.Date() - 27, end = Sys.Date()),
+    dateRangeInput("dates", "Show dates", start = Sys.Date() - 27, end = Sys.Date()),
     layout_columns(
       col_widths = c(6, 6),
       actionButton("preset_28", "Last 28 days", class = "btn-sm btn-outline-secondary w-100"),
       actionButton("preset_365", "Last 12 months", class = "btn-sm btn-outline-secondary w-100")
     ),
-    tags$div(style = "margin-top:10px;"),
-    actionButton("fetch", "Fetch latest data", class = "btn-primary w-100"),
-    tags$small("Fetch pulls new data from Catapult for the dates above."),
+    hr(),
+    tags$strong("Refresh from Catapult"),
+    dateRangeInput("sync_dates", NULL, start = Sys.Date() - 6, end = Sys.Date()),
+    actionButton("fetch", "Refresh these dates", class = "btn-primary w-100"),
+    tags$small("Re-pulls every session in these dates and updates the saved copy, so sessions you've renamed or coded since they uploaded are corrected. The last 7 days are also refreshed automatically every 12 hours. For a long range (more than a few weeks) use the GitHub 'Run workflow' button instead."),
     tags$div(style = "margin-top:10px;"),
     textOutput("status"),
     hr(),
@@ -290,11 +300,11 @@ server <- function(input, output, session) {
   stored_on_start <- tryCatch(load_stored_data(), error = function(e) NULL)
   if (!is.null(stored_on_start)) {
     raw_data(stored_on_start)
-    status_msg(paste0("Loaded ", nrow(stored_on_start), " stored jump events. Fetch only pulls what's new."))
+    status_msg(paste0("Loaded ", nrow(stored_on_start), " stored jump events."))
   } else if (!nzchar(Sys.getenv("SUPABASE_HOST"))) {
     status_msg("Database not configured (see setup notes at the top of this file) - Fetch will pull from Catapult but won't be saved.")
   } else {
-    status_msg("No stored data yet. Set a date range and click Fetch latest data.")
+    status_msg("No stored data yet. Set the refresh dates and click Refresh these dates.")
   }
 
   do_fetch <- function() {
@@ -306,7 +316,7 @@ server <- function(input, output, session) {
       last_amount <- 0
       d <- tryCatch(
         fetch_jump_data(
-          token, input$dates[1], input$dates[2],
+          token, input$sync_dates[1], input$sync_dates[2] + 1,  # +1 so sessions starting late on the last day (UTC) are included
           on_progress = function(msg, amount) {
             incProgress(amount - last_amount, detail = msg)
             last_amount <<- amount
@@ -322,7 +332,7 @@ server <- function(input, output, session) {
         merged <- tryCatch(load_stored_data(), error = function(e) NULL)
         if (!is.null(merged)) {
           raw_data(merged)
-          status_msg(paste0("Fetched ", nrow(d), " events from Catapult. Now showing ", nrow(merged), " total stored events."))
+          status_msg(paste0("Refreshed ", nrow(d), " events from Catapult. Now showing ", nrow(merged), " total stored events."))
         } else {
           raw_data(d)
           note <- if (identical(save_result, "ok")) "but couldn't read the database back" else save_result
@@ -336,6 +346,7 @@ server <- function(input, output, session) {
   # window fresh for every visitor (otherwise it goes stale on a long-running app).
   session$onFlushed(function() {
     updateDateRangeInput(session, "dates", start = Sys.Date() - 27, end = Sys.Date())
+    updateDateRangeInput(session, "sync_dates", start = Sys.Date() - 6, end = Sys.Date())
   }, once = TRUE)
 
   observeEvent(input$fetch, { do_fetch() })
