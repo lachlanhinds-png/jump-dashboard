@@ -52,6 +52,11 @@ library(DBI)
 library(RPostgres)
 
 BASE_URL <- "https://connect-au.catapultsports.com/api/v6"
+# Sessions are dated, and days/weeks are cut, in Adelaide time (not UTC) so an
+# early-morning session lands on the right day, and Monday starts the week locally.
+LOCAL_TZ <- "Australia/Adelaide"
+today_local <- function() as.Date(format(Sys.time(), "%Y-%m-%d", tz = LOCAL_TZ))
+to_local_date <- function(epoch_seconds) as.Date(format(as.POSIXct(epoch_seconds, origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d", tz = LOCAL_TZ))
 
 DB_COLUMNS <- c("activity_id", "activity_name", "athlete_id", "athlete_name",
                 "start_time", "end_time", "jump_attribute", "basketball_load", "period_name")
@@ -105,6 +110,11 @@ sync_jumps <- function(d, start_date, end_date) {
   if (has_rows) {
     for (col in setdiff(DB_COLUMNS, colnames(d))) d[[col]] <- NA
     d <- d[, DB_COLUMNS, drop = FALSE]
+    # start/end times are stored as whole seconds (bigint), so round them here the
+    # same way - otherwise fractional times never match the stored copy and every
+    # stored row would look "missing from Catapult".
+    d$start_time <- round(as.numeric(d$start_time))
+    d$end_time <- round(as.numeric(d$end_time))
     d <- d[!duplicated(d[, KEY_COLUMNS, drop = FALSE]), , drop = FALSE]
   }
 
@@ -112,8 +122,8 @@ sync_jumps <- function(d, start_date, end_date) {
   on.exit(DBI::dbDisconnect(con))
   qlist <- function(ids) paste(DBI::dbQuoteLiteral(con, as.character(ids)), collapse = ", ")
   num <- function(x) format(x, scientific = FALSE)
-  s_epoch <- num(as.numeric(as.POSIXct(as.Date(start_date), tz = "UTC")))
-  e_epoch <- num(as.numeric(as.POSIXct(as.Date(end_date), tz = "UTC")) + 86400)
+  s_epoch <- num(as.numeric(as.POSIXct(format(as.Date(start_date)), tz = LOCAL_TZ)))
+  e_epoch <- num(as.numeric(as.POSIXct(format(as.Date(end_date)), tz = LOCAL_TZ)) + 86400)
 
   if (has_rows) DBI::dbWriteTable(con, "jumps_staging", d, temporary = TRUE, overwrite = TRUE)
 
@@ -204,7 +214,7 @@ fetch_jump_data <- function(token, start_date, end_date, on_progress = function(
   all_listed_ids <- as.character(activities$id)   # every activity Catapult lists, before the date filter
 
   activities <- activities %>%
-    mutate(date = as.Date(as.POSIXct(start_time, origin = "1970-01-01", tz = "UTC"))) %>%
+    mutate(date = to_local_date(start_time)) %>%
     filter(date >= as.Date(start_date), date <= as.Date(end_date))
 
   if (safe_nrow(activities) == 0) stop("No activities in that date range.")
@@ -342,7 +352,7 @@ ui <- page_sidebar(
   tags$head(tags$style(".view-mode .form-group, .view-mode .shiny-input-container { margin-bottom: 0; }")),
   sidebar = sidebar(
     width = 300,
-    dateRangeInput("dates", "Show dates", start = Sys.Date() - 27, end = Sys.Date()),
+    dateRangeInput("dates", "Show dates", start = today_local() - 27, end = today_local()),
     layout_columns(
       col_widths = c(6, 6),
       actionButton("preset_28", "Last 28 days", class = "btn-sm btn-outline-secondary w-100"),
@@ -350,7 +360,7 @@ ui <- page_sidebar(
     ),
     hr(),
     tags$strong("Refresh from Catapult"),
-    dateRangeInput("sync_dates", NULL, start = Sys.Date() - 6, end = Sys.Date()),
+    dateRangeInput("sync_dates", NULL, start = today_local() - 6, end = today_local()),
     actionButton("fetch", "Refresh these dates", class = "btn-primary w-100"),
     tags$small("Re-pulls every session in these dates and updates the saved copy, so sessions you've renamed or coded since they uploaded are corrected. The last 7 days are also refreshed automatically every 12 hours. For a long range (more than a few weeks) use the GitHub 'Run workflow' button instead."),
     tags$div(style = "margin-top:10px;"),
@@ -457,16 +467,16 @@ server <- function(input, output, session) {
   # The UI is built once when the app starts, so set the rolling 28-day
   # window fresh for every visitor (otherwise it goes stale on a long-running app).
   session$onFlushed(function() {
-    updateDateRangeInput(session, "dates", start = Sys.Date() - 27, end = Sys.Date())
-    updateDateRangeInput(session, "sync_dates", start = Sys.Date() - 6, end = Sys.Date())
+    updateDateRangeInput(session, "dates", start = today_local() - 27, end = today_local())
+    updateDateRangeInput(session, "sync_dates", start = today_local() - 6, end = today_local())
   }, once = TRUE)
 
   observeEvent(input$fetch, { do_fetch() })
   observeEvent(input$preset_28, {
-    updateDateRangeInput(session, "dates", start = Sys.Date() - 27, end = Sys.Date())
+    updateDateRangeInput(session, "dates", start = today_local() - 27, end = today_local())
   })
   observeEvent(input$preset_365, {
-    updateDateRangeInput(session, "dates", start = Sys.Date() - 364, end = Sys.Date())
+    updateDateRangeInput(session, "dates", start = today_local() - 364, end = today_local())
   })
   output$status <- renderText(status_msg())
 
@@ -474,7 +484,7 @@ server <- function(input, output, session) {
   shaped <- reactive({
     req(raw_data())
     d <- raw_data()
-    d$.date <- as.Date(as.POSIXct(d$start_time, origin = "1970-01-01", tz = "UTC"))
+    d$.date <- to_local_date(d$start_time)
     d$.jump_cs <- if (JUMP_TIME_COL %in% colnames(d)) {
       suppressWarnings(as.numeric(d[[JUMP_TIME_COL]]))   # raw centiseconds, used for the high-jump cut-off
     } else {
@@ -521,7 +531,7 @@ server <- function(input, output, session) {
     daily <- d %>%
       group_by(.date) %>%
       summarise(high = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
-    days <- seq(min(daily$.date), max(Sys.Date(), max(daily$.date)), by = "day")
+    days <- seq(min(daily$.date), max(today_local(), max(daily$.date)), by = "day")
     full <- data.frame(date = days) %>%
       left_join(daily, by = c("date" = ".date")) %>%
       mutate(high = ifelse(is.na(high), 0, high))
@@ -591,7 +601,7 @@ server <- function(input, output, session) {
     wk <- d %>%
       group_by(.week) %>%
       summarise(high = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
-    weeks <- seq(min(wk$.week), max(week_start(Sys.Date()), max(wk$.week)), by = "week")
+    weeks <- seq(min(wk$.week), max(week_start(today_local()), max(wk$.week)), by = "week")
     full <- data.frame(week = weeks) %>%
       left_join(wk, by = c("week" = ".week")) %>%
       mutate(high = ifelse(is.na(high), 0, high))
@@ -840,7 +850,7 @@ server <- function(input, output, session) {
   }, server = FALSE)
 
   output$download_csv <- downloadHandler(
-    filename = function() paste0(gsub(" ", "_", req(input$athlete)), "_jump_data_", Sys.Date(), ".csv"),
+    filename = function() paste0(gsub(" ", "_", req(input$athlete)), "_jump_data_", today_local(), ".csv"),
     content = function(file) {
       d <- athlete_data() %>% select(athlete_name, .date, activity_name, .jump_time_s)
       names(d) <- c("athlete", "date", "session", "jump_time_s")
