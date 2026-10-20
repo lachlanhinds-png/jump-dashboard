@@ -87,6 +87,19 @@ load_stored_data <- function() {
   as_tibble(d)
 }
 
+# Player load per athlete per activity (see sync_loads). NULL if the table
+# doesn't exist yet or the database isn't reachable.
+load_stored_loads <- function() {
+  if (!nzchar(Sys.getenv("SUPABASE_HOST"))) return(NULL)
+  con <- tryCatch(get_db_con(), error = function(e) NULL)
+  if (is.null(con)) return(NULL)
+  on.exit(DBI::dbDisconnect(con))
+  d <- tryCatch(DBI::dbGetQuery(con, "SELECT * FROM activity_load"), error = function(e) NULL)
+  if (is.null(d) || nrow(d) == 0) return(NULL)
+  d$start_time <- as.numeric(d$start_time)
+  as_tibble(d)
+}
+
 # Syncs the store with what Catapult currently has for a date window:
 #  1. adds new jumps and refreshes jumps already stored (names, coding, values);
 #  2. removes stored jumps Catapult no longer has - athletes taken out of an
@@ -188,6 +201,140 @@ sync_jumps <- function(d, start_date, end_date) {
       res$removed_stale <- DBI::dbExecute(con, paste0("DELETE FROM jumps WHERE ", where_stale))
     if (do_cleanup && !is.null(where_orphan) && n_orphan > 0)
       res$removed_orphan <- DBI::dbExecute(con, paste0("DELETE FROM jumps WHERE ", where_orphan))
+  })
+  res
+}
+
+# ---------- Player load (Catapult /stats) ----------
+# Player load is a session-level figure (about 250-400 per athlete per session),
+# not something stored per jump, so it comes from Catapult's /stats endpoint:
+# one row per athlete per activity. It is kept in its own table, activity_load.
+
+catapult_post_json <- function(url, token, body) {
+  response <- httr::POST(url,
+    httr::add_headers(authorization = paste("Bearer", token)),
+    httr::content_type_json(), httr::accept_json(),
+    body = jsonlite::toJSON(body, auto_unbox = TRUE), httr::timeout(240))
+  if (httr::status_code(response) >= 300) {
+    stop(paste0("Request failed (", httr::status_code(response), "): ", url,
+                " - ", rawToChar(response$content)))
+  }
+  jsonlite::fromJSON(rawToChar(response$content))
+}
+
+# `act` is a data frame of activities with columns id, name, start_time.
+# Returns one row per athlete per activity, with attribute "ok_ids" = the
+# activities whose request succeeded (so a failed request never deletes anything).
+fetch_activity_loads <- function(token, act, on_progress = function(msg, amount = 0) NULL) {
+  empty <- data.frame(activity_id = character(), athlete_id = character(), activity_name = character(),
+                      athlete_name = character(), start_time = numeric(), total_player_load = numeric(),
+                      stringsAsFactors = FALSE)
+  ids <- as.character(act$id)
+  if (length(ids) == 0) { attr(empty, "ok_ids") <- character(); return(empty) }
+  chunks <- split(ids, ceiling(seq_along(ids) / 20))
+  parts <- list()
+  ok_ids <- character()
+  first_shape_logged <- FALSE
+  for (k in seq_along(chunks)) {
+    ch <- chunks[[k]]
+    on_progress(paste0("Player load ", k, "/", length(chunks)), k / length(chunks))
+    res <- tryCatch(
+      catapult_post_json(paste0(BASE_URL, "/stats"), token,
+        list(filters = list(list(name = "activity_id", comparison = "=", values = as.list(ch))),
+             parameters = list("total_player_load"),
+             group_by = list("athlete", "activity"))),
+      error = function(e) { message("  Player load request failed: ", conditionMessage(e)); NULL }
+    )
+    if (is.null(res)) next
+    if (is.list(res) && !is.data.frame(res) && !is.null(res$data)) res <- res$data
+    if (length(res) == 0) { ok_ids <- c(ok_ids, ch); next }
+    res <- tryCatch(as.data.frame(res), error = function(e) NULL)
+    if (is.null(res) || !all(c("athlete_id", "activity_id", "total_player_load") %in% names(res))) {
+      message("  Player load response not in the expected shape. Columns: ",
+              paste(names(res), collapse = ", "))
+      next
+    }
+    if (!first_shape_logged) {
+      message("  Player load columns: ", paste(names(res), collapse = ", "), " (", nrow(res), " rows in first request)")
+      first_shape_logged <- TRUE
+    }
+    df <- data.frame(
+      activity_id = as.character(res$activity_id),
+      athlete_id = as.character(res$athlete_id),
+      athlete_name = if ("athlete_name" %in% names(res)) as.character(res$athlete_name) else NA_character_,
+      total_player_load = suppressWarnings(as.numeric(res$total_player_load)),
+      stringsAsFactors = FALSE)
+    df <- df[!is.na(df$athlete_id) & !is.na(df$total_player_load), , drop = FALSE]
+    m <- match(df$activity_id, as.character(act$id))
+    df$activity_name <- as.character(act$name)[m]
+    df$start_time <- round(as.numeric(act$start_time)[m])
+    parts[[length(parts) + 1]] <- df
+    ok_ids <- c(ok_ids, ch)
+  }
+  out <- if (length(parts) > 0) do.call(rbind, parts) else empty
+  out <- out[, names(empty), drop = FALSE]
+  out <- out[!duplicated(out[, c("activity_id", "athlete_id")]), , drop = FALSE]
+  attr(out, "ok_ids") <- ok_ids
+  out
+}
+
+# Stores player load and mirrors Catapult for the window, like sync_jumps does:
+# adds/updates rows, and removes rows for athletes taken out of an activity or
+# activities that no longer exist. Safeguards: only activities whose request
+# succeeded are touched, nothing is deleted if no rows came back at all, and a
+# cleanup that would remove over half of the window's rows is skipped.
+sync_loads <- function(loads, all_ids, start_date, end_date) {
+  res <- list(upserted = 0, removed = 0, note = "")
+  ok_ids <- attr(loads, "ok_ids")
+  con <- get_db_con()
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, paste0(
+    "CREATE TABLE IF NOT EXISTS activity_load (activity_id text NOT NULL, athlete_id text NOT NULL, ",
+    "activity_name text, athlete_name text, start_time bigint, total_player_load double precision, ",
+    "PRIMARY KEY (activity_id, athlete_id))"))
+  qlist <- function(ids) paste(DBI::dbQuoteLiteral(con, as.character(ids)), collapse = ", ")
+  num <- function(x) format(x, scientific = FALSE)
+  s_epoch <- num(as.numeric(as.POSIXct(format(as.Date(start_date)), tz = LOCAL_TZ)))
+  e_epoch <- num(as.numeric(as.POSIXct(format(as.Date(end_date)), tz = LOCAL_TZ)) + 86400)
+  has_rows <- !is.null(loads) && nrow(loads) > 0
+  if (has_rows) DBI::dbWriteTable(con, "loads_staging", as.data.frame(loads), temporary = TRUE, overwrite = TRUE)
+
+  where_stale <- NULL
+  if (has_rows && length(ok_ids) > 0) {
+    where_stale <- paste0("activity_id IN (", qlist(ok_ids), ") AND NOT EXISTS (SELECT 1 FROM loads_staging s WHERE ",
+      "s.activity_id = activity_load.activity_id AND s.athlete_id = activity_load.athlete_id)")
+  }
+  where_orphan <- NULL
+  if (has_rows && length(all_ids) > 0) {
+    where_orphan <- paste0("start_time >= ", s_epoch, " AND start_time < ", e_epoch,
+                           " AND activity_id NOT IN (", qlist(all_ids), ")")
+  }
+  count_where <- function(w) if (is.null(w)) 0 else
+    as.numeric(DBI::dbGetQuery(con, paste0("SELECT count(*) AS n FROM activity_load WHERE ", w))$n)
+  window_rows <- as.numeric(DBI::dbGetQuery(con, paste0(
+    "SELECT count(*) AS n FROM activity_load WHERE start_time >= ", s_epoch, " AND start_time < ", e_epoch))$n)
+  n_stale <- count_where(where_stale)
+  n_orphan <- count_where(where_orphan)
+  do_cleanup <- TRUE
+  if (window_rows > 50 && (n_stale + n_orphan) > 0.5 * window_rows) {
+    do_cleanup <- FALSE
+    res$note <- paste0("Player load cleanup skipped: it would have removed ", n_stale + n_orphan, " of ",
+                       window_rows, " stored rows in this window, which looks wrong.")
+  }
+  DBI::dbWithTransaction(con, {
+    if (has_rows) {
+      DBI::dbExecute(con, paste0(
+        "INSERT INTO activity_load (activity_id, athlete_id, activity_name, athlete_name, start_time, total_player_load) ",
+        "SELECT activity_id, athlete_id, activity_name, athlete_name, start_time, total_player_load FROM loads_staging ",
+        "ON CONFLICT (activity_id, athlete_id) DO UPDATE SET activity_name = EXCLUDED.activity_name, ",
+        "athlete_name = EXCLUDED.athlete_name, start_time = EXCLUDED.start_time, ",
+        "total_player_load = EXCLUDED.total_player_load"))
+      res$upserted <- nrow(loads)
+    }
+    if (do_cleanup && !is.null(where_stale) && n_stale > 0)
+      res$removed <- res$removed + DBI::dbExecute(con, paste0("DELETE FROM activity_load WHERE ", where_stale))
+    if (do_cleanup && !is.null(where_orphan) && n_orphan > 0)
+      res$removed <- res$removed + DBI::dbExecute(con, paste0("DELETE FROM activity_load WHERE ", where_orphan))
   })
   res
 }
@@ -327,6 +474,7 @@ fetch_jump_data <- function(token, start_date, end_date, on_progress = function(
   attr(all_data, "all_listed_ids") <- all_listed_ids
   attr(all_data, "complete_ids") <- complete_ids
   attr(all_data, "failed_ids") <- failed_ids
+  attr(all_data, "window_activities") <- as.data.frame(activities[, intersect(c("id", "name", "start_time"), colnames(activities)), drop = FALSE])
   all_data
 }
 
@@ -400,26 +548,48 @@ ui <- page_sidebar(
     numericInput("high_cut", NULL, value = 82, min = 1, max = 300),
     tags$small("A jump counts as high at or above this. OpenField lists the High band as 80, but 82 reproduces its session counts exactly (checked on two sessions), so 82 is the default.")
   ),
-  card(
-    card_header("Overview"),
-    textOutput("overview_jumps"),
-    textOutput("overview_avg"),
-    textOutput("overview_max")
-  ),
-  card(
-    card_header(
-      div(class = "d-flex justify-content-between align-items-start gap-3",
-          div(style = "flex:1;", textOutput("trend_header")),
-          div(class = "view-mode", style = "width:210px; flex:none;",
-              selectInput("view_mode", NULL, width = "100%",
-                          choices = c("Rolling day by day" = "day", "Week view (Mon\u2013Sun)" = "week"),
-                          selected = "day")))
+  navset_tab(
+    id = "main_tab",
+    nav_panel(
+      "Overview",
+    card(
+      card_header("Overview"),
+      textOutput("overview_jumps"),
+      textOutput("overview_avg"),
+      textOutput("overview_max")
     ),
-    plotlyOutput("trend_plot", height = 680)
-  ),
-  card(
-    card_header(textOutput("table_header")),
-    DTOutput("daily_table")
+    card(
+      card_header(
+        div(class = "d-flex justify-content-between align-items-start gap-3",
+            div(style = "flex:1;", textOutput("trend_header")),
+            div(class = "view-mode", style = "width:210px; flex:none;",
+                selectInput("view_mode", NULL, width = "100%",
+                            choices = c("Rolling day by day" = "day", "Week view (Mon\u2013Sun)" = "week"),
+                            selected = "day")))
+      ),
+      plotlyOutput("trend_plot", height = 680)
+    ),
+    card(
+      card_header(textOutput("table_header")),
+      DTOutput("daily_table")
+    )
+    ),
+    nav_panel(
+      "Longitudinal analysis",
+      card(
+        card_header(textOutput("long_title")),
+        tags$small("Total work per calendar year for the selected athlete, using all stored data (the date window and Top N settings don't apply here). Solid columns (left axis) are the year's totals; lighter striped columns (right axis) are the weekly average. Past full years are divided by 52, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
+        textOutput("long_note")
+      ),
+      card(
+        card_header(textOutput("long_high_header")),
+        plotlyOutput("long_plot", height = 600)
+      ),
+      card(
+        card_header("Year by year"),
+        DTOutput("long_table")
+      )
+    )
   )
 )
 
@@ -428,6 +598,7 @@ ui <- page_sidebar(
 server <- function(input, output, session) {
   token <- Sys.getenv("CATAPULT_TOKEN")
   raw_data <- reactiveVal(NULL)
+  loads_data <- reactiveVal(tryCatch(load_stored_loads(), error = function(e) NULL))
   status_msg <- reactiveVal("Loading stored data...")
 
   # Load whatever's already in Supabase the moment the app opens - no API
@@ -474,6 +645,17 @@ server <- function(input, output, session) {
           if (removed > 0) clean_txt <- paste0(clean_txt, "Removed ", removed, " rows Catapult no longer has (", sync_info$detail, "). ")
           if (sync_info$failed > 0) clean_txt <- paste0(clean_txt, sync_info$failed, " activities were skipped (Catapult errors) - refresh again. ")
           if (nzchar(sync_info$note)) clean_txt <- paste0(clean_txt, sync_info$note, " ")
+        }
+        # Player load for the same activities (kept in its own table).
+        win <- attr(d, "window_activities")
+        if (!is.null(win) && nrow(win) > 0) {
+          loads <- tryCatch(fetch_activity_loads(token, win), error = function(e) NULL)
+          if (!is.null(loads)) {
+            li <- tryCatch(sync_loads(loads, attr(d, "all_listed_ids"), input$sync_dates[1], input$sync_dates[2] + 1),
+                           error = function(e) NULL)
+            if (!is.null(li) && nzchar(li$note)) clean_txt <- paste0(clean_txt, li$note, " ")
+            loads_data(tryCatch(load_stored_loads(), error = function(e) loads_data()))
+          }
         }
         merged <- tryCatch(load_stored_data(), error = function(e) NULL)
         if (!is.null(merged)) {
@@ -888,6 +1070,129 @@ server <- function(input, output, session) {
     ) %>%
       formatStyle(columns = setdiff(colnames(main_display), "key"),
                   color = "#EDE3CE", backgroundColor = "#122029")
+  }, server = FALSE)
+
+  # ---------- Longitudinal analysis: total work per calendar year ----------
+  # One row per year for the selected athlete: total jumps, high jumps and
+  # player load (the stored per-jump load values, summed), plus the weekly
+  # average. Past full years are divided by 52; the current year by the weeks
+  # elapsed so far. If the stored data starts part-way through a year, that
+  # year is divided by the weeks the data actually covers (flagged on screen).
+  yearly_summary <- reactive({
+    d <- athlete_all()
+    req(nrow(d) > 0)
+    cut <- high_cut_val()
+    today <- today_local()
+    data_start <- min(shaped()$.date, na.rm = TRUE)   # earliest stored date, any athlete
+    d$.year <- as.integer(format(d$.date, "%Y"))
+    yearly <- d %>%
+      group_by(year = .year) %>%
+      summarise(jumps = n(), high_jumps = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
+    # Player load: the sum of this athlete's per-session player load (activity_load table).
+    ld <- loads_data()
+    if (!is.null(ld) && nrow(ld) > 0) {
+      ld <- ld[ld$athlete_id %in% unique(d$athlete_id) & !is.na(ld$start_time), , drop = FALSE]
+      if (nrow(ld) > 0) {
+        ld$.year <- as.integer(format(to_local_date(ld$start_time), "%Y"))
+        yearly_load <- ld %>% group_by(year = .year) %>%
+          summarise(load = sum(total_player_load, na.rm = TRUE), sessions_with_load = n(), .groups = "drop")
+        yearly <- full_join(yearly, yearly_load, by = "year")
+      }
+    }
+    if (!"load" %in% colnames(yearly)) { yearly$load <- 0; yearly$sessions_with_load <- 0 }
+    this_year <- as.integer(format(today, "%Y"))
+    full <- data.frame(year = seq(min(yearly$year), max(this_year, max(yearly$year)))) %>%
+      left_join(yearly, by = "year") %>%
+      mutate(across(c(jumps, high_jumps, load, sessions_with_load), ~ ifelse(is.na(.x), 0, .x)))
+    jan1 <- as.Date(paste0(full$year, "-01-01"))
+    dec31 <- as.Date(paste0(full$year, "-12-31"))
+    cov_start <- pmax(jan1, data_start)
+    cov_end <- pmin(dec31, today)
+    full$is_current <- full$year == this_year
+    full$partial_start <- cov_start > jan1
+    full$weeks <- ifelse(full$is_current | full$partial_start,
+                         as.numeric(cov_end - cov_start + 1) / 7, 52)
+    full$label <- ifelse(full$is_current, paste0(full$year, " (to date)"),
+                  ifelse(full$partial_start, paste0(full$year, " (from ", format(cov_start, "%d %b"), ")"),
+                         as.character(full$year)))
+    full$jumps_wk <- full$jumps / full$weeks
+    full$high_wk <- full$high_jumps / full$weeks
+    full$load_wk <- full$load / full$weeks
+    full
+  })
+
+  output$long_title <- renderText({
+    req(input$athlete)
+    paste0("Work per year - ", input$athlete)
+  })
+  output$long_high_header <- renderText(paste0(
+    "Total jumps, high jumps (>= ", high_cut_val(), ") and player load per year - columns on the left axis are year totals, ",
+    "lighter striped columns on the right axis are the weekly average"))
+  output$long_note <- renderText({
+    y <- yearly_summary()
+    notes <- character()
+    cur <- y[y$is_current, ]
+    if (nrow(cur) == 1) notes <- c(notes, paste0(cur$year, " is divided by ", round(cur$weeks, 1), " weeks so far."))
+    part <- y[y$partial_start & !y$is_current, ]
+    if (nrow(part) > 0) notes <- c(notes, paste0(
+      paste(part$year, collapse = ", "), " only has stored data from part-way through the year, so it is divided by ",
+      paste(round(part$weeks, 1), collapse = ", "), " weeks (the weeks covered), not 52."))
+    if (sum(y$load) == 0) notes <- c(notes, "No player load stored for this athlete yet (it is added by the next update).")
+    paste(notes, collapse = " ")
+  })
+
+  # One chart, columns only: for each year, three columns of year totals
+  # (left axis) beside three lighter, striped columns of the weekly average
+  # (right axis). Each metric keeps its own colour.
+  output$long_plot <- renderPlotly({
+    df <- yearly_summary()
+    req(nrow(df) > 0)
+    col_jumps <- "111,140,163"; col_high <- "209,96,77"; col_load <- "79,179,169"
+    solid <- function(rgb) list(color = paste0("rgba(", rgb, ",0.9)"))
+    striped <- function(rgb) list(color = paste0("rgba(", rgb, ",0.55)"),
+                                  pattern = list(shape = "/", size = 6, solidity = 0.35,
+                                                 fgcolor = paste0("rgba(", rgb, ",0.95)")))
+    bar <- function(p, y, name, marker, group, axis, tmpl) {
+      add_trace(p, y = y, type = "bar", name = name, marker = marker, yaxis = axis,
+                offsetgroup = group, alignmentgroup = "years",
+                hovertemplate = paste0("<b>%{x}</b><br>", tmpl, "<extra></extra>"))
+    }
+    plot_ly(df, x = ~label) %>%
+      bar(df$jumps, "Total jumps (year)", solid(col_jumps), "tj", "y", "Total jumps: %{y:,.0f}") %>%
+      bar(df$high_jumps, "High jumps (year)", solid(col_high), "hj", "y", "High jumps: %{y:,.0f}") %>%
+      bar(df$load, "Player load (year)", solid(col_load), "pl", "y", "Player load: %{y:,.0f}") %>%
+      bar(df$jumps_wk, "Total jumps (per week)", striped(col_jumps), "tjw", "y2", "Total jumps per week: %{y:,.1f}") %>%
+      bar(df$high_wk, "High jumps (per week)", striped(col_high), "hjw", "y2", "High jumps per week: %{y:,.1f}") %>%
+      bar(df$load_wk, "Player load (per week)", striped(col_load), "plw", "y2", "Player load per week: %{y:,.1f}") %>%
+      layout(
+        paper_bgcolor = "transparent", plot_bgcolor = "transparent",
+        font = list(color = "#EDE3CE", size = 11),
+        barmode = "group", bargap = 0.25,
+        xaxis = list(title = "", showgrid = FALSE, categoryorder = "array", categoryarray = df$label),
+        yaxis = list(title = "Year total", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero", tickformat = ",d"),
+        yaxis2 = list(title = "Per week (average)", overlaying = "y", side = "right", showgrid = FALSE,
+                      zeroline = FALSE, rangemode = "tozero", tickformat = ",d",
+                      titlefont = list(color = "#8FA9BD"), tickfont = list(color = "#8FA9BD")),
+        legend = list(orientation = "h", x = 0, y = 1.12),
+        margin = list(t = 50)
+      )
+  })
+
+  output$long_table <- renderDT({
+    y <- yearly_summary() %>% arrange(desc(year))
+    tab <- y %>%
+      transmute(
+        Year = label,
+        `Weeks counted` = round(weeks, 1),
+        Jumps = jumps,
+        `Jumps / week` = round(jumps_wk, 1),
+        `High jumps` = high_jumps,
+        `High / week` = round(high_wk, 1),
+        `Player load` = round(load, 1),
+        `Load / week` = round(load_wk, 1)
+      )
+    datatable(tab, rownames = FALSE, options = list(dom = "t", paging = FALSE, ordering = FALSE)) %>%
+      formatStyle(columns = colnames(tab), color = "#EDE3CE", backgroundColor = "#122029")
   }, server = FALSE)
 
   output$download_csv <- downloadHandler(
