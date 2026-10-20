@@ -1169,12 +1169,13 @@ server <- function(input, output, session) {
         font = list(color = "#EDE3CE", size = 11),
         barmode = "group", bargap = 0.25,
         xaxis = list(title = "", showgrid = FALSE, categoryorder = "array", categoryarray = df$label),
-        yaxis = list(title = "Year total", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero", tickformat = ",d"),
+        yaxis = list(title = "Year total", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+                     tickformat = ",d", automargin = TRUE),
         yaxis2 = list(title = "Per week (average)", overlaying = "y", side = "right", showgrid = FALSE,
-                      zeroline = FALSE, rangemode = "tozero", tickformat = ",d",
+                      zeroline = FALSE, rangemode = "tozero", tickformat = ",d", automargin = TRUE,
                       titlefont = list(color = "#8FA9BD"), tickfont = list(color = "#8FA9BD")),
         legend = list(orientation = "h", x = 0, y = 1.12),
-        margin = list(t = 50)
+        margin = list(t = 50, r = 80)
       )
   })
 
