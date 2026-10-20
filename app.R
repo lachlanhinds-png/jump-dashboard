@@ -388,6 +388,14 @@ ui <- page_sidebar(
     tags$strong("Average = top N jumps (per session, or per week in week view)"),
     numericInput("top_n", NULL, value = 10, min = 1, max = 50),
     hr(),
+    tags$strong("Jump time axis range (seconds)"),
+    layout_columns(
+      col_widths = c(6, 6),
+      numericInput("y_min", "Min", value = NA, step = 0.1),
+      numericInput("y_max", "Max", value = NA, step = 0.1)
+    ),
+    tags$small("Leave blank for automatic: the data's range plus 0.25 s above and below, so the lines sit flatter. Type e.g. 0.9 and 1.5 to fix the axis."),
+    hr(),
     tags$strong("High jump cut-off (centiseconds)"),
     numericInput("high_cut", NULL, value = 82, min = 1, max = 300),
     tags$small("A jump counts as high at or above this. OpenField lists the High band as 80, but 82 reproduces its session counts exactly (checked on two sessions), so 82 is the default.")
@@ -673,6 +681,18 @@ server <- function(input, output, session) {
     agg <- plot_data()
     req(nrow(agg) > 0)
     chronic_name <- if (is_week()) "Chronic high jumps (previous 4 weeks, avg/week)" else "Chronic high jumps (previous 28 days, avg/day)"
+    # Left (jump time) axis: wider than the data so the lines look steadier.
+    tv <- c(agg$max_time_s, agg$avg_time_s)
+    tv <- tv[is.finite(tv)]
+    req(length(tv) > 0)
+    y_lo <- floor((min(tv) - 0.25) * 20) / 20
+    y_hi <- ceiling((max(tv) + 0.25) * 20) / 20
+    if (!is.null(input$y_min) && !is.na(input$y_min)) y_lo <- input$y_min
+    if (!is.null(input$y_max) && !is.na(input$y_max)) y_hi <- input$y_max
+    if (y_hi <= y_lo) {   # nonsense typed in - fall back to automatic
+      y_lo <- floor((min(tv) - 0.25) * 20) / 20
+      y_hi <- ceiling((max(tv) + 0.25) * 20) / 20
+    }
     p <- plot_ly(agg, x = ~label)
     # Chronic: rolling average of high jumps (rest days/weeks = 0), drawn first
     # so it sits behind everything as a light shaded area. Skipped when there
@@ -707,7 +727,8 @@ server <- function(input, output, session) {
         font = list(color = "#EDE3CE", size = 10),
         xaxis = list(title = "", showgrid = FALSE, automargin = TRUE, tickangle = -45, tickfont = list(size = 10),
                      categoryorder = "array", categoryarray = agg$label),
-        yaxis = list(title = "Jump Time (s)", showgrid = FALSE, zeroline = FALSE, automargin = TRUE, dtick = 0.05,
+        yaxis = list(title = "Jump Time (s)", showgrid = FALSE, zeroline = FALSE, automargin = TRUE, dtick = 0.1,
+                     range = c(y_lo, y_hi),
                      titlefont = list(size = 11), tickfont = list(size = 9)),
         yaxis2 = list(title = "# Jumps", overlaying = "y", side = "right", showgrid = FALSE, zeroline = FALSE,
                       automargin = TRUE, rangemode = "tozero", tickformat = "d",
