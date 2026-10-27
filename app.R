@@ -100,6 +100,22 @@ load_stored_loads <- function() {
   as_tibble(d)
 }
 
+# One small row per athlete per session (jumps, high jumps at the 82 cut-off,
+# best jump) - kept for the full history so the Longitudinal tab doesn't need
+# every individual jump. NULL if the table doesn't exist yet.
+load_stored_summary <- function() {
+  if (!nzchar(Sys.getenv("SUPABASE_HOST"))) return(NULL)
+  con <- tryCatch(get_db_con(), error = function(e) NULL)
+  if (is.null(con)) return(NULL)
+  on.exit(DBI::dbDisconnect(con))
+  d <- tryCatch(DBI::dbGetQuery(con, "SELECT * FROM activity_summary"), error = function(e) NULL)
+  if (is.null(d) || nrow(d) == 0) return(NULL)
+  d$start_time <- as.numeric(d$start_time)
+  d$jumps <- as.numeric(d$jumps)
+  d$high_jumps <- as.numeric(d$high_jumps)
+  as_tibble(d)
+}
+
 # Syncs the store with what Catapult currently has for a date window:
 #  1. adds new jumps and refreshes jumps already stored (names, coding, values);
 #  2. removes stored jumps Catapult no longer has - athletes taken out of an
@@ -578,7 +594,8 @@ ui <- page_sidebar(
       "Longitudinal analysis",
       card(
         card_header(textOutput("long_title")),
-        tags$small("Total work per calendar year for the selected athlete, using all stored data (the date window and Top N settings don't apply here). Solid columns (left axis) are the year's totals; lighter striped columns (right axis) are the weekly average. Past full years are divided by 52, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
+        uiOutput("long_athlete_ui"),
+        tags$small("Total work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Solid columns (left axis) are the year's totals; lighter striped columns (right axis) are the weekly average. Past full years are divided by 52, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
         textOutput("long_note")
       ),
       card(
@@ -599,6 +616,7 @@ server <- function(input, output, session) {
   token <- Sys.getenv("CATAPULT_TOKEN")
   raw_data <- reactiveVal(NULL)
   loads_data <- reactiveVal(tryCatch(load_stored_loads(), error = function(e) NULL))
+  summary_data <- reactiveVal(tryCatch(load_stored_summary(), error = function(e) NULL))
   status_msg <- reactiveVal("Loading stored data...")
 
   # Load whatever's already in Supabase the moment the app opens - no API
@@ -1078,20 +1096,54 @@ server <- function(input, output, session) {
   # average. Past full years are divided by 52; the current year by the weeks
   # elapsed so far. If the stored data starts part-way through a year, that
   # year is divided by the weeks the data actually covers (flagged on screen).
+  # Athletes available on the Longitudinal tab: everyone with a stored session
+  # summary (full history) plus everyone with individual jumps stored.
+  long_athletes <- reactive({
+    sm <- summary_data()
+    nm <- character()
+    if (!is.null(sm)) nm <- c(nm, sm$athlete_name)
+    if (!is.null(raw_data())) nm <- c(nm, raw_data()$athlete_name)
+    sort(unique(nm[!is.na(nm)]))
+  })
+
+  output$long_athlete_ui <- renderUI({
+    ch <- long_athletes()
+    req(length(ch) > 0)
+    keep <- isolate(input$long_athlete)
+    sel <- if (!is.null(keep) && keep %in% ch) keep else if (!is.null(input$athlete) && input$athlete %in% ch) input$athlete else ch[1]
+    selectInput("long_athlete", "Athlete", choices = ch, selected = sel)
+  })
+
   yearly_summary <- reactive({
-    d <- athlete_all()
-    req(nrow(d) > 0)
-    cut <- high_cut_val()
+    who <- req(input$long_athlete)
     today <- today_local()
-    data_start <- min(shaped()$.date, na.rm = TRUE)   # earliest stored date, any athlete
-    d$.year <- as.integer(format(d$.date, "%Y"))
-    yearly <- d %>%
-      group_by(year = .year) %>%
-      summarise(jumps = n(), high_jumps = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
+    sm <- summary_data()
+    use_summary <- !is.null(sm) && any(sm$athlete_name == who, na.rm = TRUE)
+    if (use_summary) {
+      # Stored per-session summaries: the full history, high jumps at the fixed 82 cut-off.
+      cut <- 82
+      s <- sm[!is.na(sm$athlete_name) & sm$athlete_name == who & !is.na(sm$start_time), , drop = FALSE]
+      s$.year <- as.integer(format(to_local_date(s$start_time), "%Y"))
+      yearly <- s %>% group_by(year = .year) %>%
+        summarise(jumps = sum(jumps), high_jumps = sum(high_jumps), .groups = "drop")
+      ids <- unique(s$athlete_id)
+      data_start <- min(to_local_date(sm$start_time), na.rm = TRUE)   # earliest stored session, any athlete
+    } else {
+      # No summaries yet: fall back to the individual jumps stored for this athlete.
+      d <- shaped() %>% filter(athlete_name == who, !is.na(.jump_time_s))
+      req(nrow(d) > 0)
+      cut <- high_cut_val()
+      d$.year <- as.integer(format(d$.date, "%Y"))
+      yearly <- d %>%
+        group_by(year = .year) %>%
+        summarise(jumps = n(), high_jumps = sum(.jump_cs >= cut, na.rm = TRUE), .groups = "drop")
+      ids <- unique(d$athlete_id)
+      data_start <- min(shaped()$.date, na.rm = TRUE)
+    }
     # Player load: the sum of this athlete's per-session player load (activity_load table).
     ld <- loads_data()
     if (!is.null(ld) && nrow(ld) > 0) {
-      ld <- ld[ld$athlete_id %in% unique(d$athlete_id) & !is.na(ld$start_time), , drop = FALSE]
+      ld <- ld[ld$athlete_id %in% ids & !is.na(ld$start_time), , drop = FALSE]
       if (nrow(ld) > 0) {
         ld$.year <- as.integer(format(to_local_date(ld$start_time), "%Y"))
         yearly_load <- ld %>% group_by(year = .year) %>%
@@ -1118,19 +1170,26 @@ server <- function(input, output, session) {
     full$jumps_wk <- full$jumps / full$weeks
     full$high_wk <- full$high_jumps / full$weeks
     full$load_wk <- full$load / full$weeks
+    attr(full, "cut") <- cut
+    attr(full, "source") <- if (use_summary) "summary" else "jumps"
     full
   })
 
   output$long_title <- renderText({
-    req(input$athlete)
-    paste0("Work per year - ", input$athlete)
+    req(input$long_athlete)
+    paste0("Work per year - ", input$long_athlete)
   })
   output$long_high_header <- renderText(paste0(
-    "Total jumps, high jumps (>= ", high_cut_val(), ") and player load per year - columns on the left axis are year totals, ",
+    "Total jumps, high jumps (>= ", attr(yearly_summary(), "cut"), ") and player load per year - columns on the left axis are year totals, ",
     "lighter striped columns on the right axis are the weekly average"))
   output$long_note <- renderText({
     y <- yearly_summary()
     notes <- character()
+    if (identical(attr(y, "source"), "summary")) {
+      notes <- c(notes, "Built from the stored session summaries (high jumps use the fixed 82 cut-off).")
+    } else {
+      notes <- c(notes, "No session summaries stored yet, so this is built from the stored individual jumps.")
+    }
     cur <- y[y$is_current, ]
     if (nrow(cur) == 1) notes <- c(notes, paste0(cur$year, " is divided by ", round(cur$weeks, 1), " weeks so far."))
     part <- y[y$partial_start & !y$is_current, ]
