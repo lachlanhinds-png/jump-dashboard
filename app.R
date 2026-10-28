@@ -609,23 +609,27 @@ ui <- page_sidebar(
       card(
         card_header(textOutput("long_title")),
         uiOutput("long_athlete_ui"),
-        tags$small("Total work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Solid columns (left axis) are the year's totals; lighter striped columns (right axis) are the weekly average. Past full years are divided by 52, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
+        tags$small("Work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Use the toggle on the chart to switch between year totals and the weekly average. Total jumps and high jumps use the left axis and player load uses the right axis, so the two scales can be compared. Past full years are divided by 52 for the weekly average, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
         textOutput("long_note")
       ),
       card(
-        card_header(textOutput("long_high_header")),
-        plotlyOutput("long_plot", height = 600)
+        card_header(
+          div(class = "d-flex justify-content-between align-items-start gap-3",
+              div(style = "flex:1;", textOutput("long_high_header")),
+              div(style = "flex:none;",
+                  radioButtons("long_view", NULL, inline = TRUE,
+                               choices = c("Year totals" = "total", "Weekly average" = "week"),
+                               selected = "total")))
+        ),
+        plotlyOutput("long_plot", height = 560)
       ),
       card(
         card_header("Year by year"),
         DTOutput("long_table")
-      )
-    ),
-    nav_panel(
-      "Age analysis",
+      ),
       card(
         card_header("Average work per week at each age"),
-        tags$small("Shows the average weekly work (total jumps, high jumps and player load) done at each age, across every athlete with a stored date of birth. Ages run birthday to birthday. Each athlete's weeks are only those we hold data for (from their first to their last stored session, rest weeks included), so a part-year counts for what it covers. An athlete's age only goes into the average once it has at least the minimum weeks below, and the average is weighted by weeks. Pick an athlete to compare against the average: their columns are striped, and are faded where they have only part of that age."),
+        tags$small("Shows the average weekly work (total jumps, high jumps and player load) done at each age, across every athlete with a stored date of birth. Total jumps and high jumps use the left axis, player load the right axis. Ages run birthday to birthday. Each athlete's weeks are only those we hold data for (from their first to their last stored session, rest weeks included), so a part-year counts for what it covers. An athlete's age only goes into the average once it has at least the minimum weeks below, and the average is weighted by weeks. Pick an athlete to compare against the average: their columns are striped, and are faded where they have only part of that age."),
         layout_columns(
           col_widths = c(4, 4, 4),
           uiOutput("age_compare_ui"),
@@ -1216,9 +1220,11 @@ server <- function(input, output, session) {
     req(input$long_athlete)
     paste0("Work per year - ", input$long_athlete)
   })
-  output$long_high_header <- renderText(paste0(
-    "Total jumps, high jumps (>= ", attr(yearly_summary(), "cut"), ") and player load per year - columns on the left axis are year totals, ",
-    "lighter striped columns on the right axis are the weekly average"))
+  output$long_high_header <- renderText({
+    cut <- attr(yearly_summary(), "cut")
+    what <- if (identical(input$long_view, "week")) "Weekly average" else "Year totals"
+    paste0(what, ": total jumps and high jumps (>= ", cut, ") on the left axis, player load on the right axis")
+  })
   output$long_note <- renderText({
     y <- yearly_summary()
     notes <- character()
@@ -1237,42 +1243,45 @@ server <- function(input, output, session) {
     paste(notes, collapse = " ")
   })
 
-  # One chart, columns only: for each year, three columns of year totals
-  # (left axis) beside three lighter, striped columns of the weekly average
-  # (right axis). Each metric keeps its own colour.
-  output$long_plot <- renderPlotly({
-    df <- yearly_summary()
-    req(nrow(df) > 0)
+  # Columns only, one group per year. Total jumps and high jumps share the left
+  # axis; player load has its own right axis so the two scales can be compared.
+  long_chart <- function(df, jumps, high, load, sfx, left_title, right_title) {
     col_jumps <- "111,140,163"; col_high <- "209,96,77"; col_load <- "79,179,169"
     solid <- function(rgb) list(color = paste0("rgba(", rgb, ",0.9)"))
-    striped <- function(rgb) list(color = paste0("rgba(", rgb, ",0.55)"),
-                                  pattern = list(shape = "/", size = 6, solidity = 0.35,
-                                                 fgcolor = paste0("rgba(", rgb, ",0.95)")))
     bar <- function(p, y, name, marker, group, axis, tmpl) {
       add_trace(p, y = y, type = "bar", name = name, marker = marker, yaxis = axis,
                 offsetgroup = group, alignmentgroup = "years",
                 hovertemplate = paste0("<b>%{x}</b><br>", tmpl, "<extra></extra>"))
     }
+    fmt <- if (sfx == "") "%{y:,.0f}" else "%{y:,.1f}"
     plot_ly(df, x = ~label) %>%
-      bar(df$jumps, "Total jumps (year)", solid(col_jumps), "tj", "y", "Total jumps: %{y:,.0f}") %>%
-      bar(df$high_jumps, "High jumps (year)", solid(col_high), "hj", "y", "High jumps: %{y:,.0f}") %>%
-      bar(df$load, "Player load (year)", solid(col_load), "pl", "y", "Player load: %{y:,.0f}") %>%
-      bar(df$jumps_wk, "Total jumps (per week)", striped(col_jumps), "tjw", "y2", "Total jumps per week: %{y:,.1f}") %>%
-      bar(df$high_wk, "High jumps (per week)", striped(col_high), "hjw", "y2", "High jumps per week: %{y:,.1f}") %>%
-      bar(df$load_wk, "Player load (per week)", striped(col_load), "plw", "y2", "Player load per week: %{y:,.1f}") %>%
+      bar(jumps, paste0("Total jumps", sfx), solid(col_jumps), "tj", "y", paste0("Total jumps", sfx, ": ", fmt)) %>%
+      bar(high, paste0("High jumps", sfx), solid(col_high), "hj", "y", paste0("High jumps", sfx, ": ", fmt)) %>%
+      bar(load, paste0("Player load", sfx), solid(col_load), "pl", "y2", paste0("Player load", sfx, ": ", fmt)) %>%
       layout(
         paper_bgcolor = "transparent", plot_bgcolor = "transparent",
         font = list(color = "#EDE3CE", size = 11),
         barmode = "group", bargap = 0.25,
         xaxis = list(title = "", showgrid = FALSE, categoryorder = "array", categoryarray = df$label),
-        yaxis = list(title = "Year total", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+        yaxis = list(title = left_title, showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
                      tickformat = ",d", automargin = TRUE),
-        yaxis2 = list(title = "Per week (average)", overlaying = "y", side = "right", showgrid = FALSE,
+        yaxis2 = list(title = right_title, overlaying = "y", side = "right", showgrid = FALSE,
                       zeroline = FALSE, rangemode = "tozero", tickformat = ",d", automargin = TRUE,
-                      titlefont = list(color = "#8FA9BD"), tickfont = list(color = "#8FA9BD")),
+                      titlefont = list(color = paste0("rgb(", col_load, ")")),
+                      tickfont = list(color = paste0("rgb(", col_load, ")"))),
         legend = list(orientation = "h", x = 0, y = 1.12),
         margin = list(t = 50, r = 80)
       )
+  }
+
+  output$long_plot <- renderPlotly({
+    df <- yearly_summary()
+    req(nrow(df) > 0)
+    if (identical(input$long_view, "week")) {
+      long_chart(df, df$jumps_wk, df$high_wk, df$load_wk, " (per week)", "Jumps / high jumps per week", "Player load per week")
+    } else {
+      long_chart(df, df$jumps, df$high_jumps, df$load, "", "Jumps / high jumps (year total)", "Player load (year total)")
+    }
   })
 
   output$long_table <- renderDT({
@@ -1418,12 +1427,13 @@ server <- function(input, output, session) {
     p <- plot_ly()
     for (m in mets) {
       wk <- paste0(m$k, "_wk")
+      ax <- if (m$k == "load") "y2" else "y"
       if (d$show_avg && nrow(d$avg) > 0) {
         y <- d$avg[[wk]][match(ages, d$avg$age)]
         low <- !is.na(n_by_age) & n_by_age < 3
         hov <- paste0("<b>Average, age ", ages, "</b><br>", m$nm, ": ", ifelse(is.na(y), "-", formatC(y, format = "f", digits = 1, big.mark = ",")),
                       "<br>", n_by_age, " athletes, ", round(d$avg$weeks[match(ages, d$avg$age)]), " athlete-weeks")
-        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0("Average - ", m$nm),
+        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0("Average - ", m$nm), yaxis = ax,
                        marker = list(color = ifelse(low, rgba(m$col, 0.4), rgba(m$col, 0.9))),
                        offsetgroup = paste0("avg_", m$k), alignmentgroup = "ages",
                        text = hov, textposition = "none", hovertemplate = "%{text}<extra></extra>")
@@ -1434,7 +1444,7 @@ server <- function(input, output, session) {
         part <- !is.na(i) & (d$ind$partial[i] | d$ind$weeks[i] < age_min_weeks_val())
         hov <- paste0("<b>", d$who, ", age ", ages, "</b><br>", m$nm, ": ", ifelse(is.na(y), "-", formatC(y, format = "f", digits = 1, big.mark = ",")),
                       "<br>", ifelse(is.na(i), "", paste0(round(d$ind$weeks[i], 1), " weeks of data", ifelse(part, " (part of the year)", ""))))
-        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0(d$who, " - ", m$nm),
+        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0(d$who, " - ", m$nm), yaxis = ax,
                        marker = list(color = ifelse(part, rgba(m$col, 0.3), rgba(m$col, 0.6)),
                                      pattern = list(shape = "/", size = 6, solidity = 0.35, fgcolor = rgba(m$col, 0.95))),
                        offsetgroup = paste0("ind_", m$k), alignmentgroup = "ages",
@@ -1446,10 +1456,13 @@ server <- function(input, output, session) {
       font = list(color = "#EDE3CE", size = 11),
       barmode = "group", bargap = 0.2,
       xaxis = list(title = "Age (n = athletes in the average)", showgrid = FALSE, categoryorder = "array", categoryarray = labels),
-      yaxis = list(title = "Per week (average)", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+      yaxis = list(title = "Jumps / high jumps per week", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
                    tickformat = ",d", automargin = TRUE),
+      yaxis2 = list(title = "Player load per week", overlaying = "y", side = "right", showgrid = FALSE,
+                    zeroline = FALSE, rangemode = "tozero", tickformat = ",d", automargin = TRUE,
+                    titlefont = list(color = "rgb(79,179,169)"), tickfont = list(color = "rgb(79,179,169)")),
       legend = list(orientation = "h", x = 0, y = 1.15),
-      margin = list(t = 60)
+      margin = list(t = 60, r = 80)
     )
   })
 
