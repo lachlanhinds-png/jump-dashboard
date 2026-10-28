@@ -58,6 +58,12 @@ LOCAL_TZ <- "Australia/Adelaide"
 today_local <- function() as.Date(format(Sys.time(), "%Y-%m-%d", tz = LOCAL_TZ))
 to_local_date <- function(epoch_seconds) as.Date(format(as.POSIXct(epoch_seconds, origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d", tz = LOCAL_TZ))
 
+# Catapult occasionally records a session duration of many hours or days (a device
+# left recording). Per-athlete session durations over 4 hours are treated as bad
+# data and left out of the minutes figures (everything else is unaffected).
+MAX_SESSION_SECONDS <- 4 * 3600
+clean_duration <- function(x) { x <- as.numeric(x); ifelse(!is.na(x) & x > MAX_SESSION_SECONDS, NA_real_, x) }
+
 DB_COLUMNS <- c("activity_id", "activity_name", "athlete_id", "athlete_name",
                 "start_time", "end_time", "jump_attribute", "basketball_load", "period_name")
 
@@ -609,7 +615,7 @@ ui <- page_sidebar(
       card(
         card_header(textOutput("long_title")),
         uiOutput("long_athlete_ui"),
-        tags$small("Work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Use the toggle on the chart to switch between year totals and the weekly average. By default the axes start above zero so year-on-year changes are easier to see (the floor is set from the lowest full year); tick 'Start axes at zero' for columns that are proportional to their values. Total jumps and high jumps use the left axis and player load uses the right axis, so the two scales can be compared. Past full years are divided by 52 for the weekly average, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
+        tags$small("Work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Use the toggle on the chart to switch between year totals and the weekly average. By default the axes start above zero so year-on-year changes are easier to see (the floor is set from the lowest full year); tick 'Start axes at zero' for columns that are proportional to their values. Total jumps, high jumps and duration (minutes) share the left axis - their numbers are of a similar size - and player load uses the right axis, so the two scales can be compared. Duration is each athlete's recorded time in the session, summed from Catapult; any single session recording over 4 hours is treated as a device left on and left out of the minutes. Past full years are divided by 52 for the weekly average, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
         textOutput("long_note")
       ),
       card(
@@ -630,7 +636,7 @@ ui <- page_sidebar(
       ),
       card(
         card_header("Average work per week at each age"),
-        tags$small("Shows the average weekly work (total jumps, high jumps and player load) done at each age, across every athlete with a stored date of birth. Total jumps and high jumps use the left axis, player load the right axis. Ages run birthday to birthday. Each athlete's weeks are only those we hold data for (from their first to their last stored session, rest weeks included), so a part-year counts for what it covers. An athlete's age only goes into the average once it has at least the minimum weeks below, and the average is weighted by weeks. Pick an athlete to compare against the average: their columns are striped, and are faded where they have only part of that age."),
+        tags$small("Shows the average weekly work (total jumps, high jumps, duration in minutes and player load) done at each age, across every athlete with a stored date of birth. Total jumps, high jumps and minutes use the left axis, player load the right axis. Ages run birthday to birthday. Each athlete's weeks are only those we hold data for (from their first to their last stored session, rest weeks included), so a part-year counts for what it covers. An athlete's age only goes into the average once it has at least the minimum weeks below, and the average is weighted by weeks. Pick an athlete to compare against the average: their columns are striped, and are faded where they have only part of that age."),
         layout_columns(
           col_widths = c(4, 4, 4),
           uiOutput("age_compare_ui"),
@@ -1188,16 +1194,19 @@ server <- function(input, output, session) {
       ld <- ld[ld$athlete_id %in% ids & !is.na(ld$start_time), , drop = FALSE]
       if (nrow(ld) > 0) {
         ld$.year <- as.integer(format(to_local_date(ld$start_time), "%Y"))
+        ld$.dur <- if ("total_duration" %in% names(ld)) clean_duration(ld$total_duration) else NA_real_
         yearly_load <- ld %>% group_by(year = .year) %>%
-          summarise(load = sum(total_player_load, na.rm = TRUE), sessions_with_load = n(), .groups = "drop")
+          summarise(load = sum(total_player_load, na.rm = TRUE),
+                    minutes = sum(.dur, na.rm = TRUE) / 60,   # Catapult duration is in seconds
+                    sessions_with_load = n(), .groups = "drop")
         yearly <- full_join(yearly, yearly_load, by = "year")
       }
     }
-    if (!"load" %in% colnames(yearly)) { yearly$load <- 0; yearly$sessions_with_load <- 0 }
+    if (!"load" %in% colnames(yearly)) { yearly$load <- 0; yearly$minutes <- 0; yearly$sessions_with_load <- 0 }
     this_year <- as.integer(format(today, "%Y"))
     full <- data.frame(year = seq(min(yearly$year), max(this_year, max(yearly$year)))) %>%
       left_join(yearly, by = "year") %>%
-      mutate(across(c(jumps, high_jumps, load, sessions_with_load), ~ ifelse(is.na(.x), 0, .x)))
+      mutate(across(c(jumps, high_jumps, load, minutes, sessions_with_load), ~ ifelse(is.na(.x), 0, .x)))
     jan1 <- as.Date(paste0(full$year, "-01-01"))
     dec31 <- as.Date(paste0(full$year, "-12-31"))
     cov_start <- pmax(jan1, data_start)
@@ -1212,6 +1221,7 @@ server <- function(input, output, session) {
     full$jumps_wk <- full$jumps / full$weeks
     full$high_wk <- full$high_jumps / full$weeks
     full$load_wk <- full$load / full$weeks
+    full$minutes_wk <- full$minutes / full$weeks
     attr(full, "cut") <- cut
     attr(full, "source") <- if (use_summary) "summary" else "jumps"
     full
@@ -1224,7 +1234,7 @@ server <- function(input, output, session) {
   output$long_high_header <- renderText({
     cut <- attr(yearly_summary(), "cut")
     what <- if (identical(input$long_view, "week")) "Weekly average" else "Year totals"
-    paste0(what, ": total jumps and high jumps (>= ", cut, ") on the left axis, player load on the right axis")
+    paste0(what, ": total jumps, high jumps (>= ", cut, ") and duration in minutes on the left axis, player load on the right axis")
   })
   output$long_note <- renderText({
     y <- yearly_summary()
@@ -1246,7 +1256,7 @@ server <- function(input, output, session) {
 
   # Columns only, one group per year. Total jumps and high jumps share the left
   # axis; player load has its own right axis so the two scales can be compared.
-  long_chart <- function(df, jumps, high, load, sfx, left_title, right_title, zero = FALSE) {
+  long_chart <- function(df, jumps, high, load, minutes, sfx, left_title, right_title, zero = FALSE) {
     # Axis range: from zero, or from a floor set at 60% of the lowest full year
     # (years that start part-way through are ignored when setting the floor;
     # their columns are simply cut off if they fall below it).
@@ -1260,8 +1270,8 @@ server <- function(input, output, session) {
       lo <- if (zero || length(v_full) == 0) 0 else nice_floor(min(v_full) * 0.6)
       c(lo, top)
     }
-    rng_left <- axis_range(jumps, high); rng_right <- axis_range(load)
-    col_jumps <- "111,140,163"; col_high <- "209,96,77"; col_load <- "79,179,169"
+    rng_left <- axis_range(c(jumps, high), minutes); rng_right <- axis_range(load)
+    col_jumps <- "111,140,163"; col_high <- "209,96,77"; col_load <- "79,179,169"; col_min <- "226,177,60"
     solid <- function(rgb) list(color = paste0("rgba(", rgb, ",0.9)"))
     bar <- function(p, y, name, marker, group, axis, tmpl) {
       add_trace(p, y = y, type = "bar", name = name, marker = marker, yaxis = axis,
@@ -1272,6 +1282,7 @@ server <- function(input, output, session) {
     plot_ly(df, x = ~label) %>%
       bar(jumps, paste0("Total jumps", sfx), solid(col_jumps), "tj", "y", paste0("Total jumps", sfx, ": ", fmt)) %>%
       bar(high, paste0("High jumps", sfx), solid(col_high), "hj", "y", paste0("High jumps", sfx, ": ", fmt)) %>%
+      bar(minutes, paste0("Duration (min)", sfx), solid(col_min), "mn", "y", paste0("Duration (min)", sfx, ": ", fmt)) %>%
       bar(load, paste0("Player load", sfx), solid(col_load), "pl", "y2", paste0("Player load", sfx, ": ", fmt)) %>%
       layout(
         paper_bgcolor = "transparent", plot_bgcolor = "transparent",
@@ -1293,9 +1304,9 @@ server <- function(input, output, session) {
     df <- yearly_summary()
     req(nrow(df) > 0)
     if (identical(input$long_view, "week")) {
-      long_chart(df, df$jumps_wk, df$high_wk, df$load_wk, " (per week)", "Jumps / high jumps per week", "Player load per week", isTRUE(input$long_zero))
+      long_chart(df, df$jumps_wk, df$high_wk, df$load_wk, df$minutes_wk, " (per week)", "Jumps / high jumps / minutes per week", "Player load per week", isTRUE(input$long_zero))
     } else {
-      long_chart(df, df$jumps, df$high_jumps, df$load, "", "Jumps / high jumps (year total)", "Player load (year total)", isTRUE(input$long_zero))
+      long_chart(df, df$jumps, df$high_jumps, df$load, df$minutes, "", "Jumps / high jumps / minutes (year total)", "Player load (year total)", isTRUE(input$long_zero))
     }
   })
 
@@ -1309,6 +1320,8 @@ server <- function(input, output, session) {
         `Jumps / week` = round(jumps_wk, 1),
         `High jumps` = high_jumps,
         `High / week` = round(high_wk, 1),
+        `Minutes` = round(minutes),
+        `Minutes / week` = round(minutes_wk, 1),
         `Player load` = round(load, 1),
         `Load / week` = round(load_wk, 1)
       )
@@ -1328,14 +1341,17 @@ server <- function(input, output, session) {
     req(!is.null(dob), nrow(dob) > 0, !is.null(sm) || !is.null(ld))
     ev <- bind_rows(
       if (!is.null(sm)) data.frame(athlete_name = sm$athlete_name, start_time = sm$start_time,
-                                   jumps = sm$jumps, high = sm$high_jumps, load = 0, stringsAsFactors = FALSE),
+                                   jumps = sm$jumps, high = sm$high_jumps, load = 0, minutes = 0, stringsAsFactors = FALSE),
       if (!is.null(ld)) data.frame(athlete_name = ld$athlete_name, start_time = ld$start_time,
-                                   jumps = 0, high = 0, load = ld$total_player_load, stringsAsFactors = FALSE)
+                                   jumps = 0, high = 0, load = ld$total_player_load,
+                                   minutes = if ("total_duration" %in% names(ld)) clean_duration(ld$total_duration) / 60 else NA_real_,
+                                   stringsAsFactors = FALSE)
     )
     ev <- ev[!is.na(ev$athlete_name) & ev$athlete_name %in% dob$athlete_name & !is.na(ev$start_time), , drop = FALSE]
     req(nrow(ev) > 0)
     ev$date <- to_local_date(ev$start_time)
     ev$load[is.na(ev$load)] <- 0
+    ev$minutes[is.na(ev$minutes)] <- 0
 
     bd <- setNames(as.Date(dob$date_of_birth), dob$athlete_name)
     age_at <- function(b, d) as.integer(format(d, "%Y")) - as.integer(format(b, "%Y")) -
@@ -1350,7 +1366,7 @@ server <- function(input, output, session) {
     ev$age <- age_at(unname(bd[ev$athlete_name]), ev$date)
 
     tot <- ev %>% group_by(athlete_name, age) %>%
-      summarise(jumps = sum(jumps), high = sum(high), load = sum(load), .groups = "drop")
+      summarise(jumps = sum(jumps), high = sum(high), load = sum(load), minutes = sum(minutes), .groups = "drop")
     win <- ev %>% group_by(athlete_name) %>%
       summarise(w_start = min(date), w_end = max(date), .groups = "drop")
 
@@ -1366,7 +1382,7 @@ server <- function(input, output, session) {
     }))
     cand %>%
       left_join(tot, by = c("athlete_name", "age")) %>%
-      mutate(across(c(jumps, high, load), ~ ifelse(is.na(.x), 0, .x)),
+      mutate(across(c(jumps, high, load, minutes), ~ ifelse(is.na(.x), 0, .x)),
              weeks = days / 7,
              partial = days < span_days - 7)
   })
@@ -1380,11 +1396,11 @@ server <- function(input, output, session) {
     b <- age_blocks()
     b <- b[b$weeks >= age_min_weeks_val(), , drop = FALSE]
     if (nrow(b) == 0) return(data.frame(age = integer(), n = integer(), weeks = numeric(),
-                                        jumps_wk = numeric(), high_wk = numeric(), load_wk = numeric()))
+                                        jumps_wk = numeric(), high_wk = numeric(), load_wk = numeric(), minutes_wk = numeric()))
     b %>% group_by(age) %>%
       summarise(n = n(), weeks = sum(weeks),
                 jumps_wk = sum(jumps) / sum(weeks), high_wk = sum(high) / sum(weeks),
-                load_wk = sum(load) / sum(weeks), .groups = "drop") %>%
+                load_wk = sum(load) / sum(weeks), minutes_wk = sum(minutes) / sum(weeks), .groups = "drop") %>%
       arrange(age)
   })
 
@@ -1422,7 +1438,7 @@ server <- function(input, output, session) {
     show_avg <- isTRUE(input$age_show_avg)
     ind <- if (!is.null(who) && nzchar(who)) b[b$athlete_name == who, , drop = FALSE] else b[0, , drop = FALSE]
     if (nrow(ind) > 0) {
-      ind <- ind %>% mutate(jumps_wk = jumps / weeks, high_wk = high / weeks, load_wk = load / weeks)
+      ind <- ind %>% mutate(jumps_wk = jumps / weeks, high_wk = high / weeks, load_wk = load / weeks, minutes_wk = minutes / weeks)
     }
     ages <- sort(unique(c(if (show_avg) avg$age, ind$age)))
     list(avg = avg, ind = ind, who = who, show_avg = show_avg, ages = ages)
@@ -1437,6 +1453,7 @@ server <- function(input, output, session) {
     mets <- list(
       list(k = "jumps", nm = "Total jumps / week", col = "111,140,163"),
       list(k = "high", nm = "High jumps / week", col = "209,96,77"),
+      list(k = "minutes", nm = "Duration (min) / week", col = "226,177,60"),
       list(k = "load", nm = "Player load / week", col = "79,179,169"))
     rgba <- function(rgb, a) paste0("rgba(", rgb, ",", a, ")")
     p <- plot_ly()
@@ -1471,7 +1488,7 @@ server <- function(input, output, session) {
       font = list(color = "#EDE3CE", size = 11),
       barmode = "group", bargap = 0.2,
       xaxis = list(title = "Age (n = athletes in the average)", showgrid = FALSE, categoryorder = "array", categoryarray = labels),
-      yaxis = list(title = "Jumps / high jumps per week", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+      yaxis = list(title = "Jumps / high jumps / minutes per week", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
                    tickformat = ",d", automargin = TRUE),
       yaxis2 = list(title = "Player load per week", overlaying = "y", side = "right", showgrid = FALSE,
                     zeroline = FALSE, rangemode = "tozero", tickformat = ",d", automargin = TRUE,
@@ -1491,6 +1508,7 @@ server <- function(input, output, session) {
       tab$`Athlete-weeks` <- round(d$avg$weeks[m])
       tab$`Avg jumps / wk` <- round(d$avg$jumps_wk[m], 1)
       tab$`Avg high / wk` <- round(d$avg$high_wk[m], 1)
+      tab$`Avg minutes / wk` <- round(d$avg$minutes_wk[m], 1)
       tab$`Avg load / wk` <- round(d$avg$load_wk[m], 1)
     }
     if (nrow(d$ind) > 0) {
@@ -1499,6 +1517,7 @@ server <- function(input, output, session) {
       tab[[paste0(nm, ": weeks")]] <- round(d$ind$weeks[i], 1)
       tab[[paste0(nm, ": jumps / wk")]] <- round(d$ind$jumps_wk[i], 1)
       tab[[paste0(nm, ": high / wk")]] <- round(d$ind$high_wk[i], 1)
+      tab[[paste0(nm, ": minutes / wk")]] <- round(d$ind$minutes_wk[i], 1)
       tab[[paste0(nm, ": load / wk")]] <- round(d$ind$load_wk[i], 1)
       tab[[paste0(nm, ": part of year?")]] <- ifelse(is.na(i), "", ifelse(d$ind$partial[i], "yes", "no"))
     }
