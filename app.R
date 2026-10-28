@@ -609,7 +609,7 @@ ui <- page_sidebar(
       card(
         card_header(textOutput("long_title")),
         uiOutput("long_athlete_ui"),
-        tags$small("Work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Use the toggle on the chart to switch between year totals and the weekly average. Total jumps and high jumps use the left axis and player load uses the right axis, so the two scales can be compared. Past full years are divided by 52 for the weekly average, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
+        tags$small("Work per calendar year for the chosen athlete, using the full stored history (the date window and Top N settings don't apply here). Use the toggle on the chart to switch between year totals and the weekly average. By default the axes start above zero so year-on-year changes are easier to see (the floor is set from the lowest full year); tick 'Start axes at zero' for columns that are proportional to their values. Total jumps and high jumps use the left axis and player load uses the right axis, so the two scales can be compared. Past full years are divided by 52 for the weekly average, the current year by the weeks elapsed so far. Player load is the sum of the athlete's per-session player load from Catapult."),
         textOutput("long_note")
       ),
       card(
@@ -619,7 +619,8 @@ ui <- page_sidebar(
               div(style = "flex:none;",
                   radioButtons("long_view", NULL, inline = TRUE,
                                choices = c("Year totals" = "total", "Weekly average" = "week"),
-                               selected = "total")))
+                               selected = "total"),
+                  checkboxInput("long_zero", "Start axes at zero", value = FALSE)))
         ),
         plotlyOutput("long_plot", height = 560)
       ),
@@ -1245,7 +1246,21 @@ server <- function(input, output, session) {
 
   # Columns only, one group per year. Total jumps and high jumps share the left
   # axis; player load has its own right axis so the two scales can be compared.
-  long_chart <- function(df, jumps, high, load, sfx, left_title, right_title) {
+  long_chart <- function(df, jumps, high, load, sfx, left_title, right_title, zero = FALSE) {
+    # Axis range: from zero, or from a floor set at 60% of the lowest full year
+    # (years that start part-way through are ignored when setting the floor;
+    # their columns are simply cut off if they fall below it).
+    nice_floor <- function(x) { if (!is.finite(x) || x <= 0) return(0); k <- 10^(floor(log10(x)) - 1); floor(x / k) * k }
+    axis_range <- function(a, b = NULL) {
+      v_all <- c(a, b); v_all <- v_all[is.finite(v_all)]
+      ok <- !df$partial_start | df$is_current
+      v_full <- c(a[ok], b[ok]); v_full <- v_full[is.finite(v_full) & v_full > 0]
+      if (length(v_all) == 0) return(NULL)
+      top <- max(v_all) * 1.05
+      lo <- if (zero || length(v_full) == 0) 0 else nice_floor(min(v_full) * 0.6)
+      c(lo, top)
+    }
+    rng_left <- axis_range(jumps, high); rng_right <- axis_range(load)
     col_jumps <- "111,140,163"; col_high <- "209,96,77"; col_load <- "79,179,169"
     solid <- function(rgb) list(color = paste0("rgba(", rgb, ",0.9)"))
     bar <- function(p, y, name, marker, group, axis, tmpl) {
@@ -1263,10 +1278,10 @@ server <- function(input, output, session) {
         font = list(color = "#EDE3CE", size = 11),
         barmode = "group", bargap = 0.25,
         xaxis = list(title = "", showgrid = FALSE, categoryorder = "array", categoryarray = df$label),
-        yaxis = list(title = left_title, showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+        yaxis = list(title = left_title, showgrid = FALSE, zeroline = FALSE, range = rng_left,
                      tickformat = ",d", automargin = TRUE),
         yaxis2 = list(title = right_title, overlaying = "y", side = "right", showgrid = FALSE,
-                      zeroline = FALSE, rangemode = "tozero", tickformat = ",d", automargin = TRUE,
+                      zeroline = FALSE, range = rng_right, tickformat = ",d", automargin = TRUE,
                       titlefont = list(color = paste0("rgb(", col_load, ")")),
                       tickfont = list(color = paste0("rgb(", col_load, ")"))),
         legend = list(orientation = "h", x = 0, y = 1.12),
@@ -1278,9 +1293,9 @@ server <- function(input, output, session) {
     df <- yearly_summary()
     req(nrow(df) > 0)
     if (identical(input$long_view, "week")) {
-      long_chart(df, df$jumps_wk, df$high_wk, df$load_wk, " (per week)", "Jumps / high jumps per week", "Player load per week")
+      long_chart(df, df$jumps_wk, df$high_wk, df$load_wk, " (per week)", "Jumps / high jumps per week", "Player load per week", isTRUE(input$long_zero))
     } else {
-      long_chart(df, df$jumps, df$high_jumps, df$load, "", "Jumps / high jumps (year total)", "Player load (year total)")
+      long_chart(df, df$jumps, df$high_jumps, df$load, "", "Jumps / high jumps (year total)", "Player load (year total)", isTRUE(input$long_zero))
     }
   })
 
