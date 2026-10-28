@@ -103,6 +103,20 @@ load_stored_loads <- function() {
 # One small row per athlete per session (jumps, high jumps at the 82 cut-off,
 # best jump) - kept for the full history so the Longitudinal tab doesn't need
 # every individual jump. NULL if the table doesn't exist yet.
+# Dates of birth (athlete_dob table). Used ONLY to work out ages for the Age
+# analysis tab - they are never shown, exported or put in a chart or tooltip.
+# NULL if the table doesn't exist or the database isn't reachable.
+load_stored_dob <- function() {
+  if (!nzchar(Sys.getenv("SUPABASE_HOST"))) return(NULL)
+  con <- tryCatch(get_db_con(), error = function(e) NULL)
+  if (is.null(con)) return(NULL)
+  on.exit(DBI::dbDisconnect(con))
+  d <- tryCatch(DBI::dbGetQuery(con, "SELECT athlete_name, date_of_birth FROM athlete_dob"), error = function(e) NULL)
+  if (is.null(d) || nrow(d) == 0) return(NULL)
+  d$date_of_birth <- as.Date(d$date_of_birth)
+  as_tibble(d)
+}
+
 load_stored_summary <- function() {
   if (!nzchar(Sys.getenv("SUPABASE_HOST"))) return(NULL)
   con <- tryCatch(get_db_con(), error = function(e) NULL)
@@ -606,6 +620,28 @@ ui <- page_sidebar(
         card_header("Year by year"),
         DTOutput("long_table")
       )
+    ),
+    nav_panel(
+      "Age analysis",
+      card(
+        card_header("Average work per week at each age"),
+        tags$small("Shows the average weekly work (total jumps, high jumps and player load) done at each age, across every athlete with a stored date of birth. Ages run birthday to birthday. Each athlete's weeks are only those we hold data for (from their first to their last stored session, rest weeks included), so a part-year counts for what it covers. An athlete's age only goes into the average once it has at least the minimum weeks below, and the average is weighted by weeks. Pick an athlete to compare against the average: their columns are striped, and are faded where they have only part of that age."),
+        layout_columns(
+          col_widths = c(4, 4, 4),
+          uiOutput("age_compare_ui"),
+          numericInput("age_min_weeks", "Minimum weeks of data for an age to count", value = 13, min = 1, max = 52, step = 1),
+          checkboxInput("age_show_avg", "Show the average", value = TRUE)
+        ),
+        textOutput("age_note")
+      ),
+      card(
+        card_header(textOutput("age_header")),
+        plotlyOutput("age_plot", height = 600)
+      ),
+      card(
+        card_header("Age by age"),
+        DTOutput("age_table")
+      )
     )
   )
 )
@@ -617,6 +653,7 @@ server <- function(input, output, session) {
   raw_data <- reactiveVal(NULL)
   loads_data <- reactiveVal(tryCatch(load_stored_loads(), error = function(e) NULL))
   summary_data <- reactiveVal(tryCatch(load_stored_summary(), error = function(e) NULL))
+  dob_data <- reactiveVal(tryCatch(load_stored_dob(), error = function(e) NULL))
   status_msg <- reactiveVal("Loading stored data...")
 
   # Load whatever's already in Supabase the moment the app opens - no API
@@ -1251,6 +1288,192 @@ server <- function(input, output, session) {
         `Player load` = round(load, 1),
         `Load / week` = round(load_wk, 1)
       )
+    datatable(tab, rownames = FALSE, options = list(dom = "t", paging = FALSE, ordering = FALSE)) %>%
+      formatStyle(columns = colnames(tab), color = "#EDE3CE", backgroundColor = "#122029")
+  }, server = FALSE)
+
+  # ---------- Age analysis: average work per week at each age ----------
+  # For every athlete with a stored date of birth, their work is split into
+  # "age years" (birthday to birthday). For each age we know the total jumps,
+  # high jumps and player load, and the number of weeks we actually hold data
+  # for (their first to last stored session, clipped to that age year).
+  # Per-week rates = total / weeks. The average for an age is the total over
+  # all qualifying athletes divided by their total weeks, i.e. weighted by weeks.
+  age_blocks <- reactive({
+    sm <- summary_data(); ld <- loads_data(); dob <- dob_data()
+    req(!is.null(dob), nrow(dob) > 0, !is.null(sm) || !is.null(ld))
+    ev <- bind_rows(
+      if (!is.null(sm)) data.frame(athlete_name = sm$athlete_name, start_time = sm$start_time,
+                                   jumps = sm$jumps, high = sm$high_jumps, load = 0, stringsAsFactors = FALSE),
+      if (!is.null(ld)) data.frame(athlete_name = ld$athlete_name, start_time = ld$start_time,
+                                   jumps = 0, high = 0, load = ld$total_player_load, stringsAsFactors = FALSE)
+    )
+    ev <- ev[!is.na(ev$athlete_name) & ev$athlete_name %in% dob$athlete_name & !is.na(ev$start_time), , drop = FALSE]
+    req(nrow(ev) > 0)
+    ev$date <- to_local_date(ev$start_time)
+    ev$load[is.na(ev$load)] <- 0
+
+    bd <- setNames(as.Date(dob$date_of_birth), dob$athlete_name)
+    age_at <- function(b, d) as.integer(format(d, "%Y")) - as.integer(format(b, "%Y")) -
+      as.integer(format(d, "%m%d") < format(b, "%m%d"))
+    bday <- function(b, a) {   # the birthday that starts age `a` (29 Feb falls back to 1 Mar)
+      y <- as.integer(format(b, "%Y")) + a
+      r <- as.Date(sprintf("%04d-%s", y, format(b, "%m-%d")), format = "%Y-%m-%d")
+      bad <- is.na(r)
+      if (any(bad)) r[bad] <- as.Date(sprintf("%04d-03-01", y[bad]), format = "%Y-%m-%d")
+      r
+    }
+    ev$age <- age_at(unname(bd[ev$athlete_name]), ev$date)
+
+    tot <- ev %>% group_by(athlete_name, age) %>%
+      summarise(jumps = sum(jumps), high = sum(high), load = sum(load), .groups = "drop")
+    win <- ev %>% group_by(athlete_name) %>%
+      summarise(w_start = min(date), w_end = max(date), .groups = "drop")
+
+    cand <- do.call(rbind, lapply(seq_len(nrow(win)), function(i) {
+      b <- unname(bd[win$athlete_name[i]])
+      ages <- age_at(b, win$w_start[i]):age_at(b, win$w_end[i])
+      s <- bday(rep(b, length(ages)), ages)
+      e <- bday(rep(b, length(ages)), ages + 1) - 1
+      data.frame(athlete_name = win$athlete_name[i], age = ages,
+                 span_days = as.numeric(e - s) + 1,
+                 days = as.numeric(pmin(e, win$w_end[i]) - pmax(s, win$w_start[i])) + 1,
+                 stringsAsFactors = FALSE)
+    }))
+    cand %>%
+      left_join(tot, by = c("athlete_name", "age")) %>%
+      mutate(across(c(jumps, high, load), ~ ifelse(is.na(.x), 0, .x)),
+             weeks = days / 7,
+             partial = days < span_days - 7)
+  })
+
+  age_min_weeks_val <- reactive({
+    v <- input$age_min_weeks
+    if (is.null(v) || is.na(v) || v < 1) 13 else v
+  })
+
+  age_avg <- reactive({
+    b <- age_blocks()
+    b <- b[b$weeks >= age_min_weeks_val(), , drop = FALSE]
+    if (nrow(b) == 0) return(data.frame(age = integer(), n = integer(), weeks = numeric(),
+                                        jumps_wk = numeric(), high_wk = numeric(), load_wk = numeric()))
+    b %>% group_by(age) %>%
+      summarise(n = n(), weeks = sum(weeks),
+                jumps_wk = sum(jumps) / sum(weeks), high_wk = sum(high) / sum(weeks),
+                load_wk = sum(load) / sum(weeks), .groups = "drop") %>%
+      arrange(age)
+  })
+
+  output$age_compare_ui <- renderUI({
+    b <- age_blocks()
+    keep <- isolate(input$age_compare)
+    ch <- c("None (average only)" = "", sort(unique(b$athlete_name)))
+    selectInput("age_compare", "Compare with", choices = ch,
+                selected = if (!is.null(keep) && keep %in% ch) keep else "")
+  })
+
+  output$age_header <- renderText({
+    who <- input$age_compare
+    if (!is.null(who) && nzchar(who)) paste0("Average work per week by age, compared with ", who)
+    else "Average work per week by age (all athletes with a date of birth)"
+  })
+
+  output$age_note <- renderText({
+    b <- age_blocks()
+    dob <- dob_data()
+    sm <- summary_data(); ld <- loads_data()
+    all_names <- unique(c(if (!is.null(sm)) sm$athlete_name, if (!is.null(ld)) ld$athlete_name))
+    n_all <- length(all_names[!is.na(all_names)])
+    n_dob <- length(unique(b$athlete_name))
+    a <- age_avg()
+    paste0(n_dob, " of ", n_all, " athletes have a date of birth stored; the others are left out. ",
+           if (nrow(a) > 0) paste0("Ages shown: ", min(a$age), " to ", max(a$age),
+                                   ". Ages built from fewer than 3 athletes are faded - treat them with caution.") else
+             "No age has enough data for the average yet - try lowering the minimum weeks.")
+  })
+
+  age_plot_data <- reactive({
+    avg <- age_avg(); b <- age_blocks()
+    who <- input$age_compare
+    show_avg <- isTRUE(input$age_show_avg)
+    ind <- if (!is.null(who) && nzchar(who)) b[b$athlete_name == who, , drop = FALSE] else b[0, , drop = FALSE]
+    if (nrow(ind) > 0) {
+      ind <- ind %>% mutate(jumps_wk = jumps / weeks, high_wk = high / weeks, load_wk = load / weeks)
+    }
+    ages <- sort(unique(c(if (show_avg) avg$age, ind$age)))
+    list(avg = avg, ind = ind, who = who, show_avg = show_avg, ages = ages)
+  })
+
+  output$age_plot <- renderPlotly({
+    d <- age_plot_data()
+    req(length(d$ages) > 0)
+    ages <- d$ages
+    n_by_age <- d$avg$n[match(ages, d$avg$age)]
+    labels <- if (d$show_avg) ifelse(is.na(n_by_age), as.character(ages), paste0(ages, "  (n=", n_by_age, ")")) else as.character(ages)
+    mets <- list(
+      list(k = "jumps", nm = "Total jumps / week", col = "111,140,163"),
+      list(k = "high", nm = "High jumps / week", col = "209,96,77"),
+      list(k = "load", nm = "Player load / week", col = "79,179,169"))
+    rgba <- function(rgb, a) paste0("rgba(", rgb, ",", a, ")")
+    p <- plot_ly()
+    for (m in mets) {
+      wk <- paste0(m$k, "_wk")
+      if (d$show_avg && nrow(d$avg) > 0) {
+        y <- d$avg[[wk]][match(ages, d$avg$age)]
+        low <- !is.na(n_by_age) & n_by_age < 3
+        hov <- paste0("<b>Average, age ", ages, "</b><br>", m$nm, ": ", ifelse(is.na(y), "-", formatC(y, format = "f", digits = 1, big.mark = ",")),
+                      "<br>", n_by_age, " athletes, ", round(d$avg$weeks[match(ages, d$avg$age)]), " athlete-weeks")
+        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0("Average - ", m$nm),
+                       marker = list(color = ifelse(low, rgba(m$col, 0.4), rgba(m$col, 0.9))),
+                       offsetgroup = paste0("avg_", m$k), alignmentgroup = "ages",
+                       text = hov, textposition = "none", hovertemplate = "%{text}<extra></extra>")
+      }
+      if (nrow(d$ind) > 0) {
+        i <- match(ages, d$ind$age)
+        y <- d$ind[[wk]][i]
+        part <- !is.na(i) & (d$ind$partial[i] | d$ind$weeks[i] < age_min_weeks_val())
+        hov <- paste0("<b>", d$who, ", age ", ages, "</b><br>", m$nm, ": ", ifelse(is.na(y), "-", formatC(y, format = "f", digits = 1, big.mark = ",")),
+                      "<br>", ifelse(is.na(i), "", paste0(round(d$ind$weeks[i], 1), " weeks of data", ifelse(part, " (part of the year)", ""))))
+        p <- add_trace(p, x = labels, y = y, type = "bar", name = paste0(d$who, " - ", m$nm),
+                       marker = list(color = ifelse(part, rgba(m$col, 0.3), rgba(m$col, 0.6)),
+                                     pattern = list(shape = "/", size = 6, solidity = 0.35, fgcolor = rgba(m$col, 0.95))),
+                       offsetgroup = paste0("ind_", m$k), alignmentgroup = "ages",
+                       text = hov, textposition = "none", hovertemplate = "%{text}<extra></extra>")
+      }
+    }
+    p %>% layout(
+      paper_bgcolor = "transparent", plot_bgcolor = "transparent",
+      font = list(color = "#EDE3CE", size = 11),
+      barmode = "group", bargap = 0.2,
+      xaxis = list(title = "Age (n = athletes in the average)", showgrid = FALSE, categoryorder = "array", categoryarray = labels),
+      yaxis = list(title = "Per week (average)", showgrid = FALSE, zeroline = FALSE, rangemode = "tozero",
+                   tickformat = ",d", automargin = TRUE),
+      legend = list(orientation = "h", x = 0, y = 1.15),
+      margin = list(t = 60)
+    )
+  })
+
+  output$age_table <- renderDT({
+    d <- age_plot_data()
+    req(length(d$ages) > 0)
+    tab <- data.frame(Age = d$ages, stringsAsFactors = FALSE)
+    if (d$show_avg && nrow(d$avg) > 0) {
+      m <- match(d$ages, d$avg$age)
+      tab$`Athletes (n)` <- d$avg$n[m]
+      tab$`Athlete-weeks` <- round(d$avg$weeks[m])
+      tab$`Avg jumps / wk` <- round(d$avg$jumps_wk[m], 1)
+      tab$`Avg high / wk` <- round(d$avg$high_wk[m], 1)
+      tab$`Avg load / wk` <- round(d$avg$load_wk[m], 1)
+    }
+    if (nrow(d$ind) > 0) {
+      i <- match(d$ages, d$ind$age)
+      nm <- d$who
+      tab[[paste0(nm, ": weeks")]] <- round(d$ind$weeks[i], 1)
+      tab[[paste0(nm, ": jumps / wk")]] <- round(d$ind$jumps_wk[i], 1)
+      tab[[paste0(nm, ": high / wk")]] <- round(d$ind$high_wk[i], 1)
+      tab[[paste0(nm, ": load / wk")]] <- round(d$ind$load_wk[i], 1)
+      tab[[paste0(nm, ": part of year?")]] <- ifelse(is.na(i), "", ifelse(d$ind$partial[i], "yes", "no"))
+    }
     datatable(tab, rownames = FALSE, options = list(dom = "t", paging = FALSE, ordering = FALSE)) %>%
       formatStyle(columns = colnames(tab), color = "#EDE3CE", backgroundColor = "#122029")
   }, server = FALSE)
