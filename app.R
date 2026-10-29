@@ -545,6 +545,29 @@ session_stats <- function(d, topn, cut) {
     mutate(session_label = paste0(activity_name, " (", format(date, "%b %d"), ")"))
 }
 
+# Exponentially weighted moving average that respects the time between points.
+# x = values (NA = nothing recorded: the line simply carries forward), t = when
+# each value happened (days, or weeks), already in order. Each new value gets
+# weight a = 1 - 0.5^(gap / half_life): a longer gap since the last point means
+# the new value counts for more, so a break doesn't stall the line. Starts at the
+# first real value. Two points on the same day count as half a day apart.
+ewma_time <- function(x, t, half_life, min_gap = 0.5) {
+  out <- rep(NA_real_, length(x)); cur <- NA_real_; cur_t <- NA_real_
+  for (i in seq_along(x)) {
+    if (!is.na(x[i])) {
+      if (is.na(cur)) {
+        cur <- x[i]
+      } else {
+        a <- 1 - 0.5^(max(t[i] - cur_t, min_gap) / half_life)
+        cur <- a * x[i] + (1 - a) * cur
+      }
+      cur_t <- t[i]
+    }
+    out[i] <- cur
+  }
+  out
+}
+
 ui <- page_sidebar(
   title = "Jump Time Dashboard",
   theme = theme,
@@ -603,6 +626,14 @@ ui <- page_sidebar(
                             choices = c("Rolling day by day" = "day", "Week view (Mon\u2013Sun)" = "week"),
                             selected = "day")))
       ),
+      div(class = "d-flex flex-wrap align-items-end gap-4 px-3 pt-2",
+          checkboxInput("ewma_show", "Show smoothed trend lines", value = TRUE),
+          conditionalPanel("input.view_mode != 'week'",
+            numericInput("ewma_half_day", "Smoothing half-life (days)", value = 7, min = 1, max = 90, step = 1, width = "190px")),
+          conditionalPanel("input.view_mode == 'week'",
+            numericInput("ewma_half_week", "Smoothing half-life (weeks)", value = 2, min = 0.5, max = 26, step = 0.5, width = "190px")),
+          tags$small(style = "flex:1; min-width:260px; padding-bottom:12px;",
+            "Thick lines are an exponentially weighted moving average of Max and Average (top N): a session or week from one half-life ago counts half as much as the latest. Longer half-life = smoother but slower to react. Days or weeks with no jumps are skipped, not counted as zero. The raw values stay as the faded lines.")),
       plotlyOutput("trend_plot", height = 680)
     ),
     card(
@@ -885,18 +916,54 @@ server <- function(input, output, session) {
     full
   })
 
+  # Smoothed (EWMA) Max and Average-of-top-N. Worked out over the athlete's whole
+  # stored history so the line is already "warmed up" at the start of the window.
+  ewma_half <- reactive({
+    v <- if (is_week()) input$ewma_half_week else input$ewma_half_day
+    if (is.null(v) || is.na(v) || v <= 0) { if (is_week()) 2 else 7 } else v
+  })
+
+  ewma_daily <- reactive({
+    d <- athlete_all()
+    req(nrow(d) > 0)
+    s <- session_stats(d, top_n_val(), high_cut_val())
+    t <- as.numeric(s$date)
+    s$ew_max <- ewma_time(s$max_time_s, t, ewma_half())
+    s$ew_avg <- ewma_time(s$avg_time_s, t, ewma_half())
+    s %>% group_by(date) %>%
+      summarise(ew_max = last(ew_max), ew_avg = last(ew_avg), .groups = "drop")
+  })
+
+  ewma_weekly <- reactive({
+    d <- athlete_all()
+    req(nrow(d) > 0)
+    topn <- top_n_val()
+    d$.week <- week_start(d$.date)
+    mx <- d %>% group_by(.week) %>% summarise(max_time_s = max(.jump_time_s), .groups = "drop")
+    av <- d %>% group_by(.week) %>% arrange(desc(.jump_time_s), .by_group = TRUE) %>%
+      slice_head(n = topn) %>% summarise(avg_time_s = mean(.jump_time_s), .groups = "drop")
+    w <- left_join(mx, av, by = ".week") %>% arrange(.week)
+    t <- as.numeric(w$.week) / 7
+    data.frame(week = w$.week,
+               ew_max = ewma_time(w$max_time_s, t, ewma_half()),
+               ew_avg = ewma_time(w$avg_time_s, t, ewma_half()))
+  })
+
   # What the graph plots, in either view.
   plot_data <- reactive({
     if (is_week()) {
       w <- week_summary() %>%
-        left_join(chronic_weekly() %>% select(week, chronic), by = "week")
+        left_join(chronic_weekly() %>% select(week, chronic), by = "week") %>%
+        left_join(ewma_weekly(), by = "week")
       data.frame(label = w$week_label, hover = paste0("Week ", w$week_range, " (", w$sessions, " sessions)"),
                  jumps = w$jumps, high_jumps = w$high_jumps,
                  max_time_s = w$max_time_s, avg_time_s = w$avg_time_s,
-                 chronic = as.numeric(w$chronic), stringsAsFactors = FALSE)
+                 chronic = as.numeric(w$chronic),
+                 ew_max = as.numeric(w$ew_max), ew_avg = as.numeric(w$ew_avg), stringsAsFactors = FALSE)
     } else {
       s <- session_summary() %>%
-        left_join(chronic_daily() %>% select(date, chronic), by = "date")
+        left_join(chronic_daily() %>% select(date, chronic), by = "date") %>%
+        left_join(ewma_daily(), by = "date")
       # Short x labels ("Tue 13 Oct") keep the chart tall; the full session name
       # is in the hover. Two sessions on one day get (1), (2).
       lab <- format(s$date, "%a %d %b")
@@ -906,7 +973,8 @@ server <- function(input, output, session) {
       data.frame(label = lab, hover = paste0(s$activity_name, " - ", format(s$date, "%a %d %b")),
                  jumps = s$jumps, high_jumps = s$high_jumps,
                  max_time_s = s$max_time_s, avg_time_s = s$avg_time_s,
-                 chronic = as.numeric(s$chronic), stringsAsFactors = FALSE)
+                 chronic = as.numeric(s$chronic),
+                 ew_max = as.numeric(s$ew_max), ew_avg = as.numeric(s$ew_avg), stringsAsFactors = FALSE)
     }
   })
 
@@ -952,7 +1020,11 @@ server <- function(input, output, session) {
                 line = list(color = "rgb(232,110,90)", width = 3.5, shape = "spline"),
                 fillcolor = "rgba(232,110,90,0.42)")
     }
-    p %>%
+    show_ew <- isTRUE(input$ewma_show) && any(!is.na(agg$ew_max) | !is.na(agg$ew_avg))
+    # Raw lines fade back when the smoothed trend is on, so the trend stands out.
+    max_col <- if (show_ew) "rgba(227,178,60,0.4)" else "#E3B23C"
+    avg_col <- if (show_ew) "rgba(79,179,169,0.4)" else "#4FB3A9"
+    p <- p %>%
       # Columns: total and high jump counts, on their own (right-hand) axis
       # since counts and seconds are on different scales. Semi-transparent so
       # the time lines stay readable through them.
@@ -965,10 +1037,20 @@ server <- function(input, output, session) {
       # Lines: jump time (left axis).
       add_trace(y = ~max_time_s, name = "Max", type = "scatter", mode = "lines+markers",
                 text = ~hover, hovertemplate = "<b>%{text}</b><br>Max: %{y:.2f} s<extra></extra>",
-                line = list(color = "#E3B23C"), marker = list(color = "#E3B23C")) %>%
+                line = list(color = max_col), marker = list(color = max_col)) %>%
       add_trace(y = ~avg_time_s, name = "Average (top N)", type = "scatter", mode = "lines+markers",
                 text = ~hover, hovertemplate = "<b>%{text}</b><br>Average (top N): %{y:.2f} s<extra></extra>",
-                line = list(color = "#4FB3A9"), marker = list(color = "#4FB3A9")) %>%
+                line = list(color = avg_col), marker = list(color = avg_col))
+    if (show_ew) {
+      p <- p %>%
+        add_trace(y = ~ew_max, name = "Max - smoothed trend", type = "scatter", mode = "lines", connectgaps = TRUE,
+                  text = ~hover, hovertemplate = "<b>%{text}</b><br>Max trend: %{y:.2f} s<extra></extra>",
+                  line = list(color = "#E3B23C", width = 4.5, shape = "spline", smoothing = 0.6)) %>%
+        add_trace(y = ~ew_avg, name = "Average - smoothed trend", type = "scatter", mode = "lines", connectgaps = TRUE,
+                  text = ~hover, hovertemplate = "<b>%{text}</b><br>Average trend: %{y:.2f} s<extra></extra>",
+                  line = list(color = "#4FB3A9", width = 4.5, shape = "spline", smoothing = 0.6))
+    }
+    p %>%
       layout(
         barmode = "group", bargap = 0.35,
         paper_bgcolor = "transparent", plot_bgcolor = "transparent",
