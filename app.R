@@ -1607,12 +1607,42 @@ server <- function(input, output, session) {
       formatStyle(columns = colnames(tab), color = "#EDE3CE", backgroundColor = "#122029")
   }, server = FALSE)
 
+  # The export is the same table you see on the front page: one row per session
+  # (day view) or one row per Mon-Sun week (week view), for the chosen athlete
+  # and date window, newest first.
   output$download_csv <- downloadHandler(
-    filename = function() paste0(gsub(" ", "_", req(input$athlete)), "_jump_data_", today_local(), ".csv"),
+    filename = function() {
+      paste0(gsub(" ", "_", req(input$athlete)), "_jump_", if (is_week()) "weekly" else "daily", "_", today_local(), ".csv")
+    },
     content = function(file) {
-      d <- athlete_data() %>% select(athlete_name, .date, activity_name, .jump_time_s)
-      names(d) <- c("athlete", "date", "session", "jump_time_s")
-      write.csv(d, file, row.names = FALSE)
+      who <- req(input$athlete)
+      if (is_week()) {
+        out <- week_summary() %>% arrange(desc(week)) %>%
+          transmute(
+            Athlete = who,
+            `Week start (Mon)` = format(week, "%Y-%m-%d"),
+            `Week end (Sun)` = format(week + 6, "%Y-%m-%d"),
+            Sessions = sessions,
+            Jumps = jumps,
+            `High Jumps` = high_jumps,
+            `Avg Time, Top N (s)` = avg_time_s,
+            `N Used` = n_used,
+            `Max Time (s)` = max_time_s
+          )
+      } else {
+        out <- session_summary() %>% arrange(desc(date), activity_name) %>%
+          transmute(
+            Athlete = who,
+            Session = activity_name,
+            Date = format(date, "%Y-%m-%d"),
+            Jumps = jumps,
+            `High Jumps` = high_jumps,
+            `Avg Time, Top N (s)` = avg_time_s,
+            `N Used` = n_used,
+            `Max Time (s)` = max_time_s
+          )
+      }
+      write.csv(out, file, row.names = FALSE, na = "")
     }
   )
 }
