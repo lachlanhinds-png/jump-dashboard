@@ -568,6 +568,10 @@ ewma_time <- function(x, t, half_life, min_gap = 0.5) {
   out
 }
 
+# Age in whole years on a given date (birthday to birthday).
+age_on_date <- function(b, d) as.integer(format(d, "%Y")) - as.integer(format(b, "%Y")) -
+  as.integer(format(d, "%m%d") < format(b, "%m%d"))
+
 ui <- page_sidebar(
   title = "Jump Time Dashboard",
   theme = theme,
@@ -673,6 +677,14 @@ ui <- page_sidebar(
           uiOutput("age_compare_ui"),
           numericInput("age_min_weeks", "Minimum weeks of data for an age to count", value = 13, min = 1, max = 52, step = 1),
           checkboxInput("age_show_avg", "Show the average", value = TRUE)
+        ),
+        conditionalPanel("input.age_compare && input.age_compare.length > 0",
+          layout_columns(
+            col_widths = c(4, 4, 4),
+            numericInput("age_prev", "Earlier ages to show (blank = every age they have data for)", value = NA, min = 0, max = 20, step = 1),
+            numericInput("age_ahead", "Ages ahead to show from the average (+1, +2 ...)", value = 1, min = 0, max = 5, step = 1),
+            tags$small(style = "padding-top:28px;", "With an athlete picked, the chart covers their ages up to today's age, plus the ages ahead you choose. Ages ahead show only the average, i.e. the workload typically done at that age.")
+          )
         ),
         textOutput("age_note")
       ),
@@ -1523,7 +1535,24 @@ server <- function(input, output, session) {
       ind <- ind %>% mutate(jumps_wk = jumps / weeks, high_wk = high / weeks, load_wk = load / weeks, minutes_wk = minutes / weeks)
     }
     ages <- sort(unique(c(if (show_avg) avg$age, ind$age)))
-    list(avg = avg, ind = ind, who = who, show_avg = show_avg, ages = ages)
+    cur_age <- NA_integer_
+    if (!is.null(who) && nzchar(who) && nrow(ind) > 0) {
+      # Athlete picked: only their own ages (up to today's age) plus the chosen
+      # number of ages ahead, which can only show the average (the norm).
+      dob <- dob_data()
+      b0 <- dob$date_of_birth[match(who, dob$athlete_name)]
+      if (!is.na(b0)) {
+        cur_age <- age_on_date(b0, today_local())
+        prev <- input$age_prev
+        ahead <- input$age_ahead
+        prev <- if (is.null(prev) || is.na(prev) || prev < 0) Inf else floor(prev)
+        ahead <- if (is.null(ahead) || is.na(ahead)) 1 else min(max(floor(ahead), 0), 5)
+        lo <- max(min(ind$age), cur_age - prev)
+        hi <- cur_age + ahead
+        ages <- ages[ages >= lo & ages <= hi]
+      }
+    }
+    list(avg = avg, ind = ind, who = who, show_avg = show_avg, ages = ages, cur_age = cur_age)
   })
 
   output$age_plot <- renderPlotly({
@@ -1532,6 +1561,10 @@ server <- function(input, output, session) {
     ages <- d$ages
     n_by_age <- d$avg$n[match(ages, d$avg$age)]
     labels <- if (d$show_avg) ifelse(is.na(n_by_age), as.character(ages), paste0(ages, "  (n=", n_by_age, ")")) else as.character(ages)
+    if (!is.na(d$cur_age)) {
+      labels <- ifelse(ages == d$cur_age, paste0(labels, "<br>current age"),
+                ifelse(ages > d$cur_age, paste0(labels, "<br>ahead (average)"), labels))
+    }
     mets <- list(
       list(k = "jumps", nm = "Total jumps / week", col = "111,140,163"),
       list(k = "high", nm = "High jumps / week", col = "209,96,77"),
